@@ -34,7 +34,7 @@ def get_piston_client_from_env(session=None):
 
 
 class PistonClient:
-    """
+    r"""
     A client that will automatically load balance across multiple Piston (https://github.com/engineer-man/piston) workers.
     This assumes piston is running our custom cms_ioi package: https://github.com/guipenedo/piston/releases/
     We recommend starting the instances with the following script as otherwise some IOI problems will hit default limits:

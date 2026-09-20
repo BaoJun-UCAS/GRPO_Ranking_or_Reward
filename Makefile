@@ -25,10 +25,10 @@ quality:
 	flake8 --max-line-length 119 $(check_dirs) setup.py
 
 test:
-	pytest -sv --ignore=tests/slow/ tests/
+	python -m pytest -sv --ignore=tests/slow/ tests/
 
 slow_test:
-	pytest -sv -vv tests/slow/
+	python -m pytest -sv -vv tests/slow/
 
 # Evaluation
 

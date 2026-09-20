@@ -484,7 +484,7 @@ echo "Manager files: ${manager_files[@]}"
 
     async def _get_run_script(self):
         """Get the run script content."""
-        return """#!/usr/bin/env bash
+        return r"""#!/usr/bin/env bash
 # disable stack limit so you don't get RE with recursion
 ulimit -s unlimited
 # some problems have 10MB+ input/output files in their test cases and you might get RE. uncomment if needed
