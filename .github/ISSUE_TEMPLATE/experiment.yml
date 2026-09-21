@@ -1,0 +1,35 @@
+name: 实验记录
+description: 记录一次可复现实验及其结论
+title: "[Experiment] "
+labels: [experiment]
+body:
+  - type: input
+    id: objective
+    attributes:
+      label: 实验目标
+      placeholder: 比较 studentization GRPO 与基线
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: 完整配置
+      description: 填写 commit、recipe、模型、数据集、GPU、seed、主要超参数和运行目录。
+    validations:
+      required: true
+  - type: textarea
+    id: commands
+    attributes:
+      label: 启动命令
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: results
+    attributes:
+      label: 结果与 artifact
+      description: 填写指标、W&B/Hugging Face 链接和服务器结果目录；不要填写密钥。
+  - type: textarea
+    id: conclusion
+    attributes:
+      label: 结论与下一步
