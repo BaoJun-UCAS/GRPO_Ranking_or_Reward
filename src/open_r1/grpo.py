@@ -12,9 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import logging
 import os
 import sys
+from dataclasses import asdict, is_dataclass
+from datetime import datetime, timezone
+from importlib.metadata import PackageNotFoundError, version
+from pathlib import Path
 
 import datasets
 import transformers
@@ -31,6 +36,65 @@ from trl import ModelConfig, TrlParser, get_peft_config
 
 
 logger = logging.getLogger(__name__)
+
+
+def _redact_secrets(value):
+    """Return a JSON-serializable configuration snapshot without credentials."""
+    if isinstance(value, dict):
+        redacted = {}
+        for key, item in value.items():
+            normalized_key = str(key).lower().replace("-", "_")
+            secret_key = normalized_key in {
+                "token",
+                "api_key",
+                "apikey",
+                "secret",
+                "password",
+                "hf_token",
+                "huggingface_token",
+                "wandb_api_key",
+            } or normalized_key.endswith(("_api_key", "_access_token", "_auth_token", "_password", "_secret"))
+            if secret_key:
+                redacted[str(key)] = "<redacted>" if item else item
+            else:
+                redacted[str(key)] = _redact_secrets(item)
+        return redacted
+    if isinstance(value, (list, tuple)):
+        return [_redact_secrets(item) for item in value]
+    return value
+
+
+def _arguments_to_dict(arguments):
+    if hasattr(arguments, "to_dict"):
+        return arguments.to_dict()
+    if is_dataclass(arguments):
+        return asdict(arguments)
+    return vars(arguments)
+
+
+def save_run_manifest(output_dir, script_args, training_args, model_args):
+    """Persist the exact parsed configuration and relevant package versions."""
+    package_versions = {}
+    for package in ("accelerate", "datasets", "deepspeed", "peft", "torch", "transformers", "trl", "vllm"):
+        try:
+            package_versions[package] = version(package)
+        except PackageNotFoundError:
+            package_versions[package] = None
+
+    manifest = {
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+        "script_arguments": _arguments_to_dict(script_args),
+        "training_arguments": _arguments_to_dict(training_args),
+        "model_arguments": _arguments_to_dict(model_args),
+        "package_versions": package_versions,
+    }
+    manifest = _redact_secrets(manifest)
+    output_path = Path(output_dir) / "run_manifest.json"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = output_path.with_suffix(".json.tmp")
+    temporary_path.write_text(json.dumps(manifest, indent=2, default=str), encoding="utf-8")
+    temporary_path.replace(output_path)
 
 
 def main(script_args, training_args, model_args):
@@ -120,6 +184,8 @@ def main(script_args, training_args, model_args):
         callbacks=get_callbacks(training_args, model_args),
         processing_class=tokenizer,
     )
+    if trainer.accelerator.is_main_process:
+        save_run_manifest(training_args.output_dir, script_args, training_args, model_args)
 
     ###############
     # Training loop

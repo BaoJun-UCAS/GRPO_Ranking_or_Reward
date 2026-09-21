@@ -2,10 +2,9 @@
 """
 Bootstrap-based LLM-as-judge evaluation with CLT confidence intervals.
 
-This script implements a robust evaluation approach using bootstrap sampling to construct
-confidence intervals for win rates. For each bootstrap iteration, it randomly subsamples
-N prompts from the full dataset, randomizes the order of completions (consistent across
-all votes for each prompt), and runs judge evaluation with majority voting.
+This script sends N unique response pairs to the judge once, then constructs confidence
+intervals by resampling those N judgments locally with replacement. This keeps the API
+cost at N judge calls (excluding retries), independent of the bootstrap count B.
 
 The output contains all low-level details from each bootstrap iteration plus statistical
 analysis including confidence intervals for win rates.
@@ -14,9 +13,11 @@ analysis including confidence intervals for win rates.
 import os
 import json
 import argparse
+import hashlib
 import re
 import random
-from typing import List, Dict, Any, Tuple
+import time
+from typing import List, Dict, Any, Optional, Tuple
 from tqdm import tqdm
 
 # NumPy for statistical calculations
@@ -51,7 +52,7 @@ def read_single_completions_artifact(path: str, completion_index: int = 0) -> Tu
         Tuple of (metadata dict, items list with 'completion' key)
     """
     # Handle both JSON and JSONL formats
-    with open(path, "r") as f:
+    with open(path, "r", encoding="utf-8") as f:
         if path.endswith(".jsonl"):
             # JSONL format: one JSON object per line
             lines = f.readlines()
@@ -340,8 +341,10 @@ def parse_survey_response(response_text: str, order_swapped: bool, allow_ties: b
     criteria = ["helpfulness", "correctness", "coherence", "complexity", "verbosity"]
     criterion_evaluations = {}
     
-    # Set regex pattern based on whether ties are allowed
-    winner_pattern = r"([ABTie]+)" if allow_ties else r"([AB])"
+    # Accept both ``Winner: A`` and the bracketed format requested in the prompt,
+    # e.g. ``Winner: [A]``.  Use explicit alternatives instead of a character
+    # class so invalid strings such as "AB" cannot be interpreted as a winner.
+    winner_pattern = r"\[?\s*(A|B|Tie)\s*\]?" if allow_ties else r"\[?\s*(A|B)\s*\]?"
     
     # Parse each criterion
     for i, criterion in enumerate(criteria, 1):
@@ -421,13 +424,35 @@ def parse_survey_response(response_text: str, order_swapped: bool, allow_ties: b
         }
     
     # Parse overall recommendation (asterisks optional for robustness)
-    overall_winner_pattern = r"([ABTie]+)" if allow_ties else r"([AB])"
-    overall_pattern = rf"\*?\*?Overall Recommendation:\*?\*?\s*.*?\[?{overall_winner_pattern}\]?.*?(?:Explain your reasoning\.|Reasoning:)\s*([^\n]+(?:\n[^\n]*)*)"
-    overall_match = re.search(overall_pattern, response_text, re.IGNORECASE | re.DOTALL)
-    
+    # Overall recommendation is always forced to A or B, even when individual
+    # criteria allow ties. Parse only the section after its heading so a letter
+    # in ordinary prose (for example the B in "Based") cannot become a winner.
+    overall_section_match = re.search(
+        r"\*?\*?Overall Recommendation:\*?\*?\s*(.*)$",
+        response_text,
+        re.IGNORECASE | re.DOTALL,
+    )
+    overall_match = None
+    overall_section = overall_section_match.group(1).strip() if overall_section_match else ""
+    if overall_section:
+        overall_match = re.search(
+            r"(?:Winner|Recommendation)\s*:\s*\[?\s*(A|B)\s*\]?",
+            overall_section,
+            re.IGNORECASE,
+        )
+        if overall_match is None:
+            overall_match = re.search(
+                r"^\s*(?:[-*]\s*)?\[?\s*(A|B)\s*\]?(?=\s*(?:[-—:]|$))",
+                overall_section,
+                re.IGNORECASE,
+            )
+
     if overall_match:
         overall_winner_raw = overall_match.group(1).strip().upper()
-        overall_justification = overall_match.group(2).strip()
+        overall_justification = overall_section[overall_match.end():].lstrip(" \t\r\n-—:")
+        overall_justification = re.sub(
+            r"^(?:Explain your reasoning\.|Reasoning:)\s*", "", overall_justification, flags=re.IGNORECASE
+        ).strip() or "No separate justification supplied"
         
         # Map overall winner to model names
         # Note: Overall winner does not allow ties (only model1 or model2 are valid)
@@ -461,23 +486,29 @@ def parse_survey_response(response_text: str, order_swapped: bool, allow_ties: b
     }
 
 
-def setup_judge_client(api_key: str):
-    if api_key.startswith("sk-ant-"):
+def setup_judge_client(api_key: str, api_provider: str = "auto", base_url: Optional[str] = None):
+    """Create a judge client without inferring DeepSeek from a secret key prefix."""
+    if api_provider == "auto":
+        api_provider = "anthropic" if api_key.startswith("sk-ant-") else "openai"
+
+    if api_provider == "anthropic":
         if anthropic is None:
             raise ImportError("anthropic package is required for Claude API. Install with: pip install anthropic")
         return "anthropic", anthropic.Anthropic(api_key=api_key)
     if openai is None:
         raise ImportError("openai package is required. Install with: pip install openai")
-    return "openai", openai.OpenAI(api_key=api_key)
+    if api_provider == "deepseek":
+        return "deepseek", openai.OpenAI(api_key=api_key, base_url=base_url or "https://api.deepseek.com")
+    client_kwargs = {"api_key": api_key}
+    if base_url:
+        client_kwargs["base_url"] = base_url
+    return "openai", openai.OpenAI(**client_kwargs)
 
 
 def call_judge(api_type: str, judge_client, judge_model: str, prompt: str, response1: str, response2: str, 
-               allow_ties: bool, order_swapped: bool = False) -> Dict[str, Any]:
+               allow_ties: bool, order_swapped: bool = False, thinking_mode: str = "disabled",
+               max_retries: int = 5) -> Dict[str, Any]:
     """Call the judge API with survey-based evaluation across 5 criteria."""
-    # Store original order for mapping back
-    original_response1 = response1
-    original_response2 = response2
-    
     # Use the predetermined order (no randomization here)
     if order_swapped:
         response1, response2 = response2, response1
@@ -557,59 +588,81 @@ Format your evaluation as follows:
 **Overall Recommendation:**
 Based on the five dimensions above, which response would you recommend overall? {winner_format}{choice_instruction} - Explain your reasoning."""
 
-    try:
-        if api_type == "anthropic":
-            response = judge_client.messages.create(
-                model=judge_model,
-                max_tokens=8192,
-                temperature=0.1,
-                messages=[
-                    {"role": "user", "content": comparison_prompt}
-                ],
-            )
-            response_text = response.content[0].text.strip()
-        elif "gpt-5" in judge_model.lower():
-            response = judge_client.chat.completions.create(
-                model=judge_model,
-                messages=[
-                    {"role": "user", "content": comparison_prompt}
-                ],
-                max_completion_tokens=16000,
-                response_format={"type": "text"},
-                reasoning_effort="medium",
-            )
-            response_text = response.choices[0].message.content.strip()
-        else:
-            response = judge_client.chat.completions.create(
-                model=judge_model,
-                messages=[
-                    {"role": "user", "content": comparison_prompt}
-                ],
-                temperature=0.1,
-                max_tokens=16000,
-            )
-            response_text = response.choices[0].message.content.strip()
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            if api_type == "anthropic":
+                response = judge_client.messages.create(
+                    model=judge_model,
+                    max_tokens=8192,
+                    temperature=0.1,
+                    messages=[{"role": "user", "content": comparison_prompt}],
+                )
+                response_text = response.content[0].text.strip()
+                usage = {
+                    "input_tokens": getattr(response.usage, "input_tokens", 0),
+                    "output_tokens": getattr(response.usage, "output_tokens", 0),
+                }
+            elif "gpt-5" in judge_model.lower() and api_type == "openai":
+                response = judge_client.chat.completions.create(
+                    model=judge_model,
+                    messages=[{"role": "user", "content": comparison_prompt}],
+                    max_completion_tokens=16000,
+                    response_format={"type": "text"},
+                    reasoning_effort="medium",
+                )
+                response_text = response.choices[0].message.content.strip()
+                usage = {
+                    "input_tokens": getattr(response.usage, "prompt_tokens", 0),
+                    "output_tokens": getattr(response.usage, "completion_tokens", 0),
+                }
+            else:
+                request_kwargs = {
+                    "model": judge_model,
+                    "messages": [{"role": "user", "content": comparison_prompt}],
+                    "max_tokens": 8192,
+                    "temperature": 0.1,
+                }
+                if api_type == "deepseek":
+                    request_kwargs["extra_body"] = {"thinking": {"type": thinking_mode}}
+                    if thinking_mode == "enabled":
+                        request_kwargs.pop("temperature", None)
+                        request_kwargs["reasoning_effort"] = "high"
+                response = judge_client.chat.completions.create(**request_kwargs)
+                response_text = response.choices[0].message.content.strip()
+                response_usage = getattr(response, "usage", None)
+                usage = {
+                    "input_tokens": getattr(response_usage, "prompt_tokens", 0),
+                    "output_tokens": getattr(response_usage, "completion_tokens", 0),
+                    "cached_input_tokens": getattr(
+                        getattr(response_usage, "prompt_tokens_details", None), "cached_tokens", 0
+                    ),
+                }
 
-        # Parse the structured survey response
-        parsed_result = parse_survey_response(response_text, order_swapped, allow_ties)
-        parsed_result["raw_response"] = response_text
-        parsed_result["order_swapped"] = order_swapped
-        
-        return parsed_result
-    except Exception as e:
-        print(f"Error calling judge API: {e}")
-        # On error, mark all as parsing failures
-        return {
+            parsed_result = parse_survey_response(response_text, order_swapped, allow_ties)
+            parsed_result["raw_response"] = response_text
+            parsed_result["order_swapped"] = order_swapped
+            parsed_result["api_usage"] = usage
+            return parsed_result
+        except Exception as exc:
+            last_error = exc
+            if attempt + 1 < max_retries:
+                delay = min(2 ** attempt, 30)
+                print(f"Judge request failed ({attempt + 1}/{max_retries}): {exc}; retrying in {delay}s")
+                time.sleep(delay)
+
+    print(f"Error calling judge API after {max_retries} attempts: {last_error}")
+    return {
             "criterion_evaluations": {
-                "helpfulness": {"winner": None, "parsing_failed": True, "justification": f"Error: {str(e)}"},
-                "correctness": {"winner": None, "parsing_failed": True, "justification": f"Error: {str(e)}"},
-                "coherence": {"winner": None, "parsing_failed": True, "justification": f"Error: {str(e)}"},
-                "complexity": {"winner": None, "parsing_failed": True, "justification": f"Error: {str(e)}"},
-                "verbosity": {"winner": None, "parsing_failed": True, "justification": f"Error: {str(e)}"}
+                "helpfulness": {"winner": None, "parsing_failed": True, "justification": f"Error: {last_error}"},
+                "correctness": {"winner": None, "parsing_failed": True, "justification": f"Error: {last_error}"},
+                "coherence": {"winner": None, "parsing_failed": True, "justification": f"Error: {last_error}"},
+                "complexity": {"winner": None, "parsing_failed": True, "justification": f"Error: {last_error}"},
+                "verbosity": {"winner": None, "parsing_failed": True, "justification": f"Error: {last_error}"}
             },
             "overall_winner": None,
             "overall_parsing_failed": True,
-            "overall_justification": f"Error during evaluation: {str(e)}",
+            "overall_justification": f"Error during evaluation: {last_error}",
             "survey_winner": None,
             "survey_calculation": {
                 "model1_wins": 0,
@@ -621,8 +674,9 @@ Based on the five dimensions above, which response would you recommend overall? 
             },
             "raw_response": "",
             "order_swapped": order_swapped,
-            "parse_error": str(e)
-        }
+            "parse_error": str(last_error),
+            "api_usage": {"input_tokens": 0, "output_tokens": 0, "cached_input_tokens": 0},
+    }
 
 
 def calculate_majority_vote(individual_judgments: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -745,55 +799,126 @@ def analyze_bootstrap_results(bootstrap_results: List[Dict[str, Any]]) -> Dict[s
     }
 
 
-def run_bootstrap_evaluation(meta1: Dict[str, Any], items1: List[Dict[str, str]], 
-                           meta2: Dict[str, Any], items2: List[Dict[str, str]], 
-                           N: int, B: int, judge_model: str, api_type: str, judge_client, 
-                           allow_ties: bool, seed: int) -> List[Dict[str, Any]]:
-    """Run bootstrap evaluation with B iterations of N subsamples each."""
-    
+def _cache_key(item: Dict[str, str], api_type: str, judge_model: str, allow_ties: bool,
+               order_swapped: bool, thinking_mode: str) -> str:
+    payload = {
+        "prompt": item["prompt"],
+        "completion1": item["completion1"],
+        "completion2": item["completion2"],
+        "api_type": api_type,
+        "judge_model": judge_model,
+        "allow_ties": allow_ties,
+        "order_swapped": order_swapped,
+        "thinking_mode": thinking_mode,
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _load_judgment_cache(cache_path: str) -> Dict[str, Dict[str, Any]]:
+    cache = {}
+    if not cache_path or not os.path.isfile(cache_path):
+        return cache
+    with open(cache_path, "r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, 1):
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                print(f"Warning: ignoring invalid cache line {line_number} in {cache_path}")
+                continue
+            if "cache_key" in record and "result" in record:
+                cache[record["cache_key"]] = record["result"]
+    return cache
+
+
+def _append_judgment_cache(cache_path: str, cache_key: str, result: Dict[str, Any]) -> None:
+    os.makedirs(os.path.dirname(os.path.abspath(cache_path)), exist_ok=True)
+    with open(cache_path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"cache_key": cache_key, "result": result}, ensure_ascii=False) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _analyze_iteration(iteration_results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    valid_overall = [result for result in iteration_results if not result.get("overall_parsing_failed", False)]
+    model1_overall_wins = sum(result.get("overall_winner") == "model1" for result in valid_overall)
+    model2_overall_wins = sum(result.get("overall_winner") == "model2" for result in valid_overall)
+
+    valid_survey = [result for result in iteration_results if result.get("survey_winner") is not None]
+    model1_survey_wins = sum(result.get("survey_winner") == "model1" for result in valid_survey)
+    model2_survey_wins = sum(result.get("survey_winner") == "model2" for result in valid_survey)
+    survey_ties = sum(result.get("survey_winner") == "tie" for result in valid_survey)
+
+    return {
+        "total_comparisons": len(iteration_results),
+        "overall_analysis": {
+            "valid_comparisons": len(valid_overall),
+            "excluded": len(iteration_results) - len(valid_overall),
+            "model1_wins": model1_overall_wins,
+            "model2_wins": model2_overall_wins,
+            "model1_win_rate": model1_overall_wins / len(valid_overall) if valid_overall else 0,
+            "model2_win_rate": model2_overall_wins / len(valid_overall) if valid_overall else 0,
+        },
+        "survey_analysis": {
+            "valid_comparisons": len(valid_survey),
+            "excluded": len(iteration_results) - len(valid_survey),
+            "model1_wins": model1_survey_wins,
+            "model2_wins": model2_survey_wins,
+            "ties": survey_ties,
+            "model1_win_rate": model1_survey_wins / len(valid_survey) if valid_survey else 0,
+            "model2_win_rate": model2_survey_wins / len(valid_survey) if valid_survey else 0,
+            "tie_rate": survey_ties / len(valid_survey) if valid_survey else 0,
+        },
+    }
+
+
+def run_bootstrap_evaluation(meta1: Dict[str, Any], items1: List[Dict[str, str]],
+                             meta2: Dict[str, Any], items2: List[Dict[str, str]],
+                             N: int, B: int, judge_model: str, api_type: str, judge_client,
+                             allow_ties: bool, seed: int, cache_path: str,
+                             thinking_mode: str = "disabled", refresh_cache: bool = False,
+                             max_retries: int = 5) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[int]]:
+    """Judge N unique pairs once, then perform all B bootstrap resamples locally."""
     if np is None:
         raise ImportError("numpy is required for bootstrap sampling. Please install it with: pip install numpy")
-    
-    # Merge completions into paired format
-    meta, all_items = merge_completions_artifacts(meta1, items1, meta2, items2)
+
+    _, all_items = merge_completions_artifacts(meta1, items1, meta2, items2)
     total_prompts = len(all_items)
-    
     if N > total_prompts:
-        raise ValueError(f"Subsample size N ({N}) cannot be larger than total prompts ({total_prompts})")
-    
-    print(f"Running bootstrap evaluation: {B} iterations of {N} subsamples from {total_prompts} total prompts")
-    
-    # Set random seed for reproducible bootstrap sampling
-    random.seed(seed)
-    np.random.seed(seed)
-    
-    bootstrap_results = []
-    
-    for b in tqdm(range(B), desc="Bootstrap iterations"):
-        # Randomly sample N prompts with replacement
-        subsample_indices = np.random.choice(total_prompts, size=N, replace=True)
-        subsample_items = [all_items[i] for i in subsample_indices]
-        
-        print(f"\nBootstrap iteration {b+1}/{B}: Evaluating {N} subsampled prompts")
-        
-        # Run evaluation on this subsample
-        iteration_results = []
-        for idx, item in enumerate(tqdm(subsample_items, desc=f"  Iteration {b+1} evaluations", leave=False)):
-            prompt = item["prompt"]
-            response1 = item["completion1"]
-            response2 = item["completion2"]
-            
-            # Randomize order for this prompt
-            order_swapped = random.choice([True, False])
-            
-            # Single judgment (no multiple votes)
-            judgment = call_judge(api_type, judge_client, judge_model, prompt, response1, response2, 
-                                allow_ties, order_swapped=order_swapped)
-            
+        raise ValueError(f"Evaluation sample size N ({N}) cannot be larger than total prompts ({total_prompts})")
+    if N < 2 or B < 1:
+        raise ValueError("N must be at least 2 and B must be at least 1")
+
+    selection_rng = random.Random(seed)
+    selected_indices = selection_rng.sample(range(total_prompts), N)
+    cached_results = {} if refresh_cache else _load_judgment_cache(cache_path)
+    judged_results = []
+
+    print(f"Judging {N} unique prompt pairs once; {B} bootstrap resamples will run locally")
+    for source_index in tqdm(selected_indices, desc="LLM judge calls"):
+        item = all_items[source_index]
+        order_swapped = selection_rng.choice([True, False])
+        cache_key = _cache_key(item, api_type, judge_model, allow_ties, order_swapped, thinking_mode)
+        cached_result = cached_results.get(cache_key)
+        if cached_result is None:
+            judgment = call_judge(
+                api_type,
+                judge_client,
+                judge_model,
+                item["prompt"],
+                item["completion1"],
+                item["completion2"],
+                allow_ties,
+                order_swapped=order_swapped,
+                thinking_mode=thinking_mode,
+                max_retries=max_retries,
+            )
             result = {
-                "prompt": prompt,
-                "model1_completion": response1,
-                "model2_completion": response2,
+                "prompt": item["prompt"],
+                "model1_completion": item["completion1"],
+                "model2_completion": item["completion2"],
                 "judgment": judgment,
                 "overall_winner": judgment.get("overall_winner"),
                 "overall_parsing_failed": judgment.get("overall_parsing_failed", False),
@@ -803,71 +928,49 @@ def run_bootstrap_evaluation(meta1: Dict[str, Any], items1: List[Dict[str, str]]
                 "model1_name": "model1",
                 "model2_name": "model2",
                 "order_swapped": order_swapped,
-                "subsample_index": int(subsample_indices[idx])
+                "source_index": source_index,
+                "cache_key": cache_key,
             }
-            iteration_results.append(result)
-        
-        # Analyze this iteration's results - separate for overall and survey
-        # Overall winner analysis (exclude parsing failures)
-        valid_overall = [r for r in iteration_results if not r.get("overall_parsing_failed", False)]
-        model1_overall_wins = sum(1 for r in valid_overall if r.get("overall_winner") == "model1")
-        model2_overall_wins = sum(1 for r in valid_overall if r.get("overall_winner") == "model2")
-        overall_excluded = len(iteration_results) - len(valid_overall)
-        
-        # Survey winner analysis (exclude None)
-        valid_survey = [r for r in iteration_results if r.get("survey_winner") is not None]
-        model1_survey_wins = sum(1 for r in valid_survey if r.get("survey_winner") == "model1")
-        model2_survey_wins = sum(1 for r in valid_survey if r.get("survey_winner") == "model2")
-        survey_ties = sum(1 for r in valid_survey if r.get("survey_winner") == "tie")
-        survey_excluded = len(iteration_results) - len(valid_survey)
-        
-        iteration_analysis = {
-            "total_comparisons": len(iteration_results),
-            "overall_analysis": {
-                "valid_comparisons": len(valid_overall),
-                "excluded": overall_excluded,
-                "model1_wins": model1_overall_wins,
-                "model2_wins": model2_overall_wins,
-                "model1_win_rate": model1_overall_wins / len(valid_overall) if len(valid_overall) > 0 else 0,
-                "model2_win_rate": model2_overall_wins / len(valid_overall) if len(valid_overall) > 0 else 0,
-            },
-            "survey_analysis": {
-                "valid_comparisons": len(valid_survey),
-                "excluded": survey_excluded,
-                "model1_wins": model1_survey_wins,
-                "model2_wins": model2_survey_wins,
-                "ties": survey_ties,
-                "model1_win_rate": model1_survey_wins / len(valid_survey) if len(valid_survey) > 0 else 0,
-                "model2_win_rate": model2_survey_wins / len(valid_survey) if len(valid_survey) > 0 else 0,
-                "tie_rate": survey_ties / len(valid_survey) if len(valid_survey) > 0 else 0,
-            }
-        }
-        
-        bootstrap_result = {
-            "iteration": b,
-            "subsample_indices": subsample_indices.tolist(),
-            "analysis": iteration_analysis,
-            "results": iteration_results
-        }
-        
-        bootstrap_results.append(bootstrap_result)
-        
-        print(f"  Overall - Model 1: {iteration_analysis['overall_analysis']['model1_win_rate']:.1%} ({iteration_analysis['overall_analysis']['model1_wins']} wins, {overall_excluded} excluded)")
-        print(f"  Overall - Model 2: {iteration_analysis['overall_analysis']['model2_win_rate']:.1%} ({iteration_analysis['overall_analysis']['model2_wins']} wins)")
-        print(f"  Survey - Model 1: {iteration_analysis['survey_analysis']['model1_win_rate']:.1%} ({iteration_analysis['survey_analysis']['model1_wins']} wins, {survey_excluded} excluded)")
-        print(f"  Survey - Model 2: {iteration_analysis['survey_analysis']['model2_win_rate']:.1%} ({iteration_analysis['survey_analysis']['model2_wins']} wins)")
-        print(f"  Survey - Ties: {iteration_analysis['survey_analysis']['tie_rate']:.1%} ({iteration_analysis['survey_analysis']['ties']} ties)")
-    
-    return bootstrap_results
+            # A transport/API failure should be retried on the next run instead of
+            # becoming a permanent cache hit. A successfully returned but unusually
+            # formatted judgment is retained and can be replaced with --refresh-cache.
+            if "parse_error" not in judgment:
+                _append_judgment_cache(cache_path, cache_key, result)
+            result["cache_hit"] = False
+        else:
+            result = dict(cached_result)
+            result["cache_hit"] = True
+        judged_results.append(result)
+
+    bootstrap_rng = np.random.default_rng(seed)
+    bootstrap_results = []
+    for iteration in tqdm(range(B), desc="Local bootstrap iterations"):
+        sample_positions = bootstrap_rng.choice(N, size=N, replace=True)
+        iteration_results = [judged_results[int(position)] for position in sample_positions]
+        bootstrap_results.append({
+            "iteration": iteration,
+            "sample_positions": sample_positions.tolist(),
+            "analysis": _analyze_iteration(iteration_results),
+        })
+
+    return bootstrap_results, judged_results, selected_indices
 
 
 def save_bootstrap_results(output_path: str, model1_path: str, model2_path: str, judge_model: str, 
                           api_type: str, seed: int, N: int, B: int, allow_ties: bool, 
-                          bootstrap_results: List[Dict[str, Any]], bootstrap_analysis: Dict[str, Any], 
+                          bootstrap_results: List[Dict[str, Any]], bootstrap_analysis: Dict[str, Any],
+                          judged_results: List[Dict[str, Any]], selected_indices: List[int],
+                          cache_path: str, base_url: Optional[str], thinking_mode: str,
                           completion_index: int = 0) -> None:
     """Save comprehensive bootstrap results to JSON file."""
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     
+    usage_totals = {"input_tokens": 0, "output_tokens": 0, "cached_input_tokens": 0}
+    for result in judged_results:
+        usage = result.get("judgment", {}).get("api_usage", {})
+        for key in usage_totals:
+            usage_totals[key] += int(usage.get(key, 0) or 0)
+
     payload = {
         "bootstrap_config": {
             "model1_path": model1_path,
@@ -879,14 +982,26 @@ def save_bootstrap_results(output_path: str, model1_path: str, model2_path: str,
             "bootstrap_iterations_B": B,
             "allow_ties": allow_ties,
             "completion_index_used": completion_index,
-            "methodology": "bootstrap_sampling_with_randomization_single_vote"
+            "thinking_mode": thinking_mode,
+            "base_url": base_url,
+            "cache_path": os.path.abspath(cache_path),
+            "methodology": "judge_N_unique_pairs_once_then_bootstrap_locally_with_replacement"
         },
+        "selected_source_indices": selected_indices,
+        "api_usage": usage_totals,
+        "cache_summary": {
+            "hits_this_run": sum(bool(result.get("cache_hit")) for result in judged_results),
+            "api_calls_this_run": sum(not bool(result.get("cache_hit")) for result in judged_results),
+        },
+        "judged_results": judged_results,
         "bootstrap_analysis": bootstrap_analysis,
         "bootstrap_results": bootstrap_results
     }
-    
-    with open(output_path, "w") as f:
-        json.dump(payload, f, indent=2)
+
+    temporary_path = f"{output_path}.tmp"
+    with open(temporary_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+    os.replace(temporary_path, output_path)
     print(f"Bootstrap results saved to {output_path}")
 
 
@@ -990,13 +1105,26 @@ def main():
     parser = argparse.ArgumentParser(description="Bootstrap-based LLM-as-judge evaluation with confidence intervals")
     parser.add_argument("--completions1", required=True, help="Path to first model's completions artifact JSON/JSONL")
     parser.add_argument("--completions2", required=True, help="Path to second model's completions artifact JSON/JSONL")
-    parser.add_argument("--judge-model", required=True, help="Judge model (gpt-4o, claude-3-5-sonnet, etc.)")
-    parser.add_argument("--api-key", required=True, help="OpenAI or Anthropic API key")
-    parser.add_argument("--N", type=int, required=True, help="Subsample size for each bootstrap iteration")
-    parser.add_argument("--B", type=int, required=True, help="Number of bootstrap iterations")
-    parser.add_argument("--allow-ties", action="store_true", help="Allow ties in evaluation")
-    parser.add_argument("--no-ties", action="store_true", help="Disable ties in evaluation")
+    parser.add_argument("--judge-model", default="deepseek-flash", help="Judge model identifier")
+    parser.add_argument(
+        "--api-provider", choices=["deepseek", "openai", "anthropic", "auto"], default="deepseek"
+    )
+    parser.add_argument("--base-url", default=None, help="OpenAI-compatible API base URL")
+    parser.add_argument(
+        "--api-key",
+        default=None,
+        help="API key. Prefer DEEPSEEK_API_KEY/OPENAI_API_KEY/ANTHROPIC_API_KEY instead of this option.",
+    )
+    parser.add_argument("--thinking-mode", choices=["enabled", "disabled"], default="disabled")
+    parser.add_argument("--max-retries", type=int, default=5)
+    parser.add_argument("--N", type=int, default=100, help="Number of unique prompt pairs sent to the judge")
+    parser.add_argument("--B", type=int, default=1000, help="Number of local bootstrap resamples")
+    tie_group = parser.add_mutually_exclusive_group()
+    tie_group.add_argument("--allow-ties", action="store_true", help="Allow ties in evaluation")
+    tie_group.add_argument("--no-ties", action="store_true", help="Disable ties in evaluation")
     parser.add_argument("--output-dir", default="evaluate", help="Directory to save results JSON")
+    parser.add_argument("--cache-path", default=None, help="Append-only JSONL judgment cache")
+    parser.add_argument("--refresh-cache", action="store_true", help="Ignore cached judgments and call the API again")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--completion-index", type=int, default=0, help="Which completion to use from multi-completion files (0=first, 1=second, etc.)")
     args = parser.parse_args()
@@ -1011,25 +1139,45 @@ def main():
     meta2, items2 = read_single_completions_artifact(args.completions2, completion_index=args.completion_index)
     print(f"Loaded {len(items2)} completions from second file")
     
-    allow_ties = args.allow_ties and not args.no_ties
-    
+    allow_ties = args.allow_ties
+
+    output_dir = determine_output_directory(args.completions1, args.completions2, args.output_dir)
+    os.makedirs(output_dir, exist_ok=True)
+    print(f"Output directory: {output_dir}")
+
+    api_key_env = {
+        "deepseek": "DEEPSEEK_API_KEY",
+        "openai": "OPENAI_API_KEY",
+        "anthropic": "ANTHROPIC_API_KEY",
+    }
+    env_name = api_key_env.get(args.api_provider, "OPENAI_API_KEY")
+    api_key = args.api_key or os.environ.get(env_name)
+    if not api_key:
+        raise ValueError(f"No API key provided. Set {env_name} or pass --api-key.")
+    resolved_base_url = args.base_url
+    if args.api_provider == "deepseek" and resolved_base_url is None:
+        resolved_base_url = "https://api.deepseek.com"
+
     # Setup judge client
-    api_type, judge_client = setup_judge_client(args.api_key)
+    api_type, judge_client = setup_judge_client(api_key, args.api_provider, resolved_base_url)
     print(f"Using {api_type.upper()} API with judge model: {args.judge_model}")
-    
+
+    cache_path = args.cache_path or os.path.join(
+        output_dir, "judge_cache", f"{clean_judge_name(args.judge_model)}_judgments.jsonl"
+    )
+
     # Run bootstrap evaluation
-    bootstrap_results = run_bootstrap_evaluation(
+    bootstrap_results, judged_results, selected_indices = run_bootstrap_evaluation(
         meta1, items1, meta2, items2, 
         args.N, args.B, args.judge_model, api_type, judge_client,
-        allow_ties, args.seed
+        allow_ties, args.seed, cache_path,
+        thinking_mode=args.thinking_mode,
+        refresh_cache=args.refresh_cache,
+        max_retries=args.max_retries,
     )
     
     # Analyze bootstrap results
     bootstrap_analysis = analyze_bootstrap_results(bootstrap_results)
-    
-    # Determine output directory based on filenames
-    output_dir = determine_output_directory(args.completions1, args.completions2, args.output_dir)
-    print(f"Output directory: {output_dir}")
     
     # Generate output filename and save results
     filename = generate_output_filename(
@@ -1056,6 +1204,11 @@ def main():
         allow_ties,
         bootstrap_results,
         bootstrap_analysis,
+        judged_results,
+        selected_indices,
+        cache_path,
+        resolved_base_url,
+        args.thinking_mode,
         completion_index=args.completion_index
     )
     

@@ -212,9 +212,12 @@ def generate_completions_vllm(prompts: List[str], vllm_model, sampling_params: A
 
 
 def write_completions_artifact(path: str, meta: Dict[str, Any], items: List[Dict[str, Any]]) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w") as f:
-        json.dump({"meta": meta, "items": items}, f, indent=2)
+    output_directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(output_directory, exist_ok=True)
+    temporary_path = f"{path}.tmp"
+    with open(temporary_path, "w", encoding="utf-8") as f:
+        json.dump({"meta": meta, "items": items}, f, indent=2, ensure_ascii=False)
+    os.replace(temporary_path, path)
     print(f"Completions artifact saved to {path}")
 
 
@@ -264,7 +267,8 @@ def main():
                 temperature=args.temperature,
                 top_p=args.top_p,
                 max_tokens=args.max_new_tokens,
-                n=args.n_completions  # Generate n completions per prompt
+                n=args.n_completions,  # Generate n completions per prompt
+                seed=args.seed,
             )
             
             # Load model directly from the specified directory
@@ -277,6 +281,7 @@ def main():
                 max_model_len=8192,
                 enforce_eager=True,
                 dtype="bfloat16",
+                seed=args.seed,
             )
             
             formatted_prompts = [format_prompt(p, tokenizer, dataset_type) for p in prompts]

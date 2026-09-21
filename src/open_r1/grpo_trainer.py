@@ -741,13 +741,27 @@ class GRPOTrainer(Trainer):
     def _collect_reward_data(self, prompts, completions, rewards, global_step):
         """Collect reward data for saving to files."""
         import json
-        
+
         # Convert tensors to lists for JSON serialization
         if isinstance(rewards, torch.Tensor):
             rewards_list = rewards.cpu().tolist()
         else:
-            rewards_list = rewards
-            
+            rewards_list = list(rewards)
+
+        # `rewards` has already been gathered across all processes, while prompts and
+        # completions are local. Select this rank's matching reward slice before saving.
+        local_count = len(prompts)
+        if len(rewards_list) != local_count:
+            start = self.accelerator.process_index * local_count
+            end = start + local_count
+            if end > len(rewards_list):
+                raise ValueError(
+                    "Cannot align gathered rewards with local prompt/completion data: "
+                    f"rank={self.accelerator.process_index}, local_count={local_count}, "
+                    f"reward_count={len(rewards_list)}"
+                )
+            rewards_list = rewards_list[start:end]
+
         # Collect data for this batch
         batch_data = []
         for i, (prompt, completion, reward) in enumerate(zip(prompts, completions, rewards_list)):
@@ -771,26 +785,31 @@ class GRPOTrainer(Trainer):
                 "rollout_index": i,
             })
         
-        # Save immediately since generation_batch_size generates fresh data every training step
+        # Save immediately since generation_batch_size generates fresh data periodically.
         self.reward_data_buffer.extend(batch_data)
-        print(f"Training step {global_step}: saving {len(batch_data)} prompt-completion pairs")
-        self._save_reward_data_buffer()
+        self._save_reward_data_buffer(global_step)
             
-    def _save_reward_data_buffer(self):
+    def _save_reward_data_buffer(self, global_step):
         """Save buffered reward data to file."""
         if not self.reward_data_buffer:
             return
-            
+
         import json
-        
-        # Create filename with training step and process index  
-        filename = f"reward_data_step_{self.state.global_step}_proc_{self.accelerator.process_index}.json"
+
+        # Include the trainer micro-step so multiple generation batches within the
+        # same optimizer step cannot overwrite each other.
+        filename = (
+            f"reward_data_step_{int(global_step):06d}_micro_{int(self._step):08d}_"
+            f"proc_{self.accelerator.process_index}.json"
+        )
         filepath = os.path.join(self.reward_data_save_path, filename)
-        
-        # Save data
-        with open(filepath, 'w') as f:
-            json.dump(self.reward_data_buffer, f, indent=2)
-            
+        temporary_filepath = f"{filepath}.tmp"
+
+        # Atomic replacement prevents a partially written JSON file after interruption.
+        with open(temporary_filepath, "w", encoding="utf-8") as f:
+            json.dump(self.reward_data_buffer, f, ensure_ascii=False)
+        os.replace(temporary_filepath, filepath)
+
         # Clear buffer
         self.reward_data_buffer.clear()
 

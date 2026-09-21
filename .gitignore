@@ -131,6 +131,8 @@ celerybeat.pid
 
 # Environments
 .env
+.env.*
+!.env.example
 .venv
 env/
 venv/
@@ -178,6 +180,19 @@ wandb/
 logs/
 eval_results/
 results/
+
+# Local experiment artifacts (never commit model weights, caches, or API outputs)
+gopo_runs/
+completions_n*/
+**/checkpoint-*/
+**/merged_model/
+**/reward_data/
+**/evaluation/
+**/judge_cache*.jsonl
+*.safetensors
+pytorch_model*.bin
+adapter_model*.bin
+adapter_model*.safetensors
 
 .vscode/
 .python-version

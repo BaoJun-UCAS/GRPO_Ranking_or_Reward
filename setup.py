@@ -42,6 +42,7 @@ if stale_egg_info.exists():
 #   * If a dependency is fast-moving (e.g. trl), pin to the exact version
 _deps = [
     "accelerate==1.4.0",
+    "anthropic>=0.49.0",
     "bitsandbytes>=0.43.0",
     "datasets>=3.2.0",
     "deepspeed==0.16.8",
@@ -59,6 +60,8 @@ _deps = [
     "lighteval @ git+https://github.com/huggingface/lighteval.git@d3da6b9bbf38104c8b5e1acc86f83541f9a502d1",  # Critical bug fix for tokenizer revisions: https://github.com/huggingface/lighteval/pull/721
     "math-verify==0.5.2",  # Used for math verification in grpo
     "morphcloud==0.1.67",
+    "numpy>=1.26.0,<3.0",
+    "openai>=1.76.0,<3.0",
     "packaging>=23.0",
     "parameterized>=0.9.0",
     "peft>=0.14.0",
@@ -68,6 +71,7 @@ _deps = [
     "safetensors>=0.3.3",
     "sentencepiece>=0.1.99",
     "torch==2.6.0",
+    "tqdm>=4.66.0",
     "transformers==4.52.3",
     "trl[vllm]==0.18.0",
     "wandb>=0.19.1",
@@ -95,7 +99,8 @@ extras["torch"] = deps_list("torch")
 extras["quality"] = deps_list("ruff", "isort", "flake8")
 extras["code"] = deps_list("e2b-code-interpreter", "python-dotenv", "morphcloud", "jieba", "pandas", "aiofiles")
 extras["eval"] = deps_list("lighteval", "math-verify")
-extras["dev"] = extras["quality"] + extras["tests"] + extras["eval"] + extras["code"]
+extras["judge"] = deps_list("openai", "anthropic", "numpy", "tqdm")
+extras["dev"] = extras["quality"] + extras["tests"] + extras["eval"] + extras["judge"] + extras["code"]
 
 # core dependencies shared across the whole project - keep this to a bare minimum :)
 install_requires = [
@@ -110,11 +115,14 @@ install_requires = [
     deps["latex2sympy2_extended"],
     deps["math-verify"],
     deps["liger-kernel"],
+    deps["numpy"],
     deps["packaging"],  # utilities from PyPA to e.g., compare versions
+    deps["peft"],
     deps["safetensors"],
     deps["sentencepiece"],
     deps["transformers"],
     deps["trl"],
+    deps["tqdm"],
     deps["wandb"],
     deps["async-lru"],
 ]

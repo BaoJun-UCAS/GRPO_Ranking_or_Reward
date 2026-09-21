@@ -2,6 +2,12 @@
 
 GRPO/GOPO training framework for language models.
 
+For the reproducible five-GPU GRPO baseline, see:
+
+- [Experiment configuration and change log](EXPERIMENT_GRPO_5GPU.md)
+- [Chinese environment setup guide](docs/ENVIRONMENT_SETUP_ZH.md)
+- [Chinese GitHub project management guide](docs/GITHUB_PROJECT_MANAGEMENT_ZH.md)
+
 ## Installation
 
 ```shell
@@ -69,12 +75,13 @@ Merges `allenai/tulu-3-sft-personas-instruction-following` (train) with `google/
 
 ## Training
 
-Training scripts are in the `train_scripts/` folder. These run GRPO/GOPO training with 4 GPUs using recipes from the `recipes/` folder.
+Training scripts are in the `train_scripts/` folder. The default GRPO Chat launcher uses one dedicated vLLM GPU plus four ZeRO-3 training GPUs. The recommended assignment for the inspected seven-GPU server is GPU 0 for vLLM and GPUs 3,4,5,6 for training.
 
 ### Running Training
 
 ```shell
-# GRPO training (regular advantage)
+# GRPO training (studentized/original advantage, LoRA, UltraChat + QRM)
+export HF_USERNAME=your_username
 bash train_scripts/qwen3_1.7_grpo_chat.sh
 
 # GOPO training (ranking advantage)
@@ -83,8 +90,16 @@ bash train_scripts/qwen3_1.7_gopo_chat.sh
 
 ### Customizing Training
 
-1. **Change GPU assignment**: Edit `CUDA_VISIBLE_DEVICES` in the bash script
-2. **Change config**: Modify `CONFIG_FILE` to point to a different recipe
+1. **Change GPU assignment without editing files**:
+   `VLLM_GPU=0 TRAIN_GPUS=3,4,5,6 bash train_scripts/qwen3_1.7_grpo_chat.sh`
+2. **Change result location**:
+   `GOPO_OUTPUT_ROOT=/your/large/disk/gopo_runs bash train_scripts/qwen3_1.7_grpo_chat.sh`
+3. **Resume an existing run**:
+   `RUN_DIR=/absolute/path/to/run bash train_scripts/qwen3_1.7_grpo_chat.sh`
+4. **Use a different preprocessed dataset**:
+   set `DATASET_NAME`; otherwise `${HF_USERNAME}/UltraChat-200k` is used.
+
+The launcher stores the resolved YAML, hardware snapshot, terminal logs, reward records, checkpoints, final adapter, and merged evaluation model under one timestamped run directory. W&B defaults to offline mode; set `WANDB_MODE=online` to upload metrics.
 
 ### Available Recipes
 
@@ -92,6 +107,7 @@ Recipes are in `recipes/Qwen3-1.7B/`:
 
 | Config | Dataset | Advantage | Reward Model |
 |--------|---------|-----------|--------------|
+| `config_chat_regular_qrm_lora_5gpu.yaml` | UltraChat | Studentization | QRM (LoRA + server vLLM) |
 | `config_chat_regular_qrm_seed42.yaml` | UltraChat | Regular | QRM |
 | `config_chat_ranking_qrm_seed42.yaml` | UltraChat | Ranking | QRM |
 | `config_tldr_regular_skywork-8b_seed42.yaml` | TLDR | Regular | Skywork-8B |
@@ -177,12 +193,22 @@ The `evaluate/` folder contains scripts for comparing model outputs using LLM-as
 python evaluate/bootstrap_judge.py \
     --completions1 <path/to/model1_completions.json> \
     --completions2 <path/to/model2_completions.json> \
-    --judge-model gpt-4o \
-    --api-key $OPENAI_API_KEY \
-    --N 25 \
-    --B 25 \
+    --api-provider deepseek \
+    --judge-model deepseek-flash \
+    --thinking-mode disabled \
+    --N 100 \
+    --B 1000 \
     --seed 42 \
     --no-ties
+```
+
+Set `DEEPSEEK_API_KEY` in the environment. Do not place the key in a recipe or shell script. The evaluator sends exactly `N` unique pairs to the API, writes each judgment immediately to an append-only cache, and performs all `B` bootstrap resamples locally. An interrupted run therefore resumes without paying for completed judgments again.
+
+For the complete post-training workflow, including base-model and trained-model generation, run:
+
+```shell
+export DEEPSEEK_API_KEY=your_key
+EVAL_GPU=0 bash evaluate/run_grpo_chat_deepseek.sh /absolute/path/to/training-run
 ```
 
 #### Arguments
@@ -191,10 +217,11 @@ python evaluate/bootstrap_judge.py \
 |----------|-------------|
 | `--completions1` | Path to first model's completions (JSON/JSONL) |
 | `--completions2` | Path to second model's completions (JSON/JSONL) |
-| `--judge-model` | LLM judge model (`gpt-4o`, `gpt-5`, `claude-3-5-sonnet`, etc.) |
-| `--api-key` | OpenAI or Anthropic API key (auto-detected by prefix) |
-| `--N` | Number of prompts to subsample per bootstrap iteration |
-| `--B` | Number of bootstrap iterations |
+| `--judge-model` | LLM judge model; defaults to `deepseek-flash` |
+| `--api-provider` | `deepseek`, `openai`, `anthropic`, or `auto` |
+| `--api-key` | Optional CLI override; environment variables are safer |
+| `--N` | Number of unique prompt pairs evaluated by the API |
+| `--B` | Number of local bootstrap resamples |
 | `--seed` | Random seed for reproducibility |
 | `--no-ties` | Force judge to pick a winner (no ties allowed) |
 | `--allow-ties` | Allow ties in evaluation |

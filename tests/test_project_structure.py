@@ -1,7 +1,9 @@
 """Fast, dependency-free checks for the source checkout."""
 
 import ast
+import re
 from pathlib import Path
+from typing import Any, Dict
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -22,7 +24,88 @@ def test_python_sources_parse():
 
 
 def test_required_project_files_exist():
-    required_files = ("README.md", "LICENSE", "setup.py", "setup.cfg", "Makefile")
+    required_files = (
+        "README.md",
+        "LICENSE",
+        "setup.py",
+        "setup.cfg",
+        "Makefile",
+        "EXPERIMENT_GRPO_5GPU.md",
+        "docs/ENVIRONMENT_SETUP_ZH.md",
+        "docs/GITHUB_PROJECT_MANAGEMENT_ZH.md",
+        "recipes/Qwen3-1.7B/config_chat_regular_qrm_lora_5gpu.yaml",
+        "train_scripts/qwen3_1.7_grpo_chat.sh",
+        "evaluate/run_grpo_chat_deepseek.sh",
+    )
 
     for filename in required_files:
         assert (PROJECT_ROOT / filename).is_file(), f"Missing required file: {filename}"
+
+
+def test_judge_parser_accepts_bracketed_winners():
+    """Exercise the real parser without importing optional API/ML packages."""
+    source_path = PROJECT_ROOT / "evaluate" / "bootstrap_judge.py"
+    syntax_tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
+    parser_function = next(
+        node
+        for node in syntax_tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "parse_survey_response"
+    )
+    namespace = {"re": re, "Dict": Dict, "Any": Any}
+    exec(compile(ast.Module(body=[parser_function], type_ignores=[]), str(source_path), "exec"), namespace)
+
+    criteria = ("Helpfulness", "Correctness", "Coherence", "Complexity", "Verbosity")
+    sections = []
+    for index, criterion in enumerate(criteria, 1):
+        winner = "B" if criterion == "Coherence" else "A"
+        sections.append(
+            f"**{index}. {criterion}**\n"
+            "- Response A: assessment\n"
+            "- Response B: assessment\n"
+            f"- Winner: [{winner}]\n"
+            "- Justification: explanation"
+        )
+    response = "\n".join(sections) + "\n**Overall Recommendation:**\n[A] - A is stronger overall."
+
+    parsed = namespace["parse_survey_response"](response, order_swapped=False, allow_ties=False)
+
+    assert parsed["overall_winner"] == "model1"
+    assert parsed["survey_winner"] == "model1"
+    assert all(not result["parsing_failed"] for result in parsed["criterion_evaluations"].values())
+
+
+def test_manifest_redacts_credentials_but_keeps_token_hyperparameters():
+    source_path = PROJECT_ROOT / "src" / "open_r1" / "grpo.py"
+    syntax_tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
+    redaction_function = next(
+        node for node in syntax_tree.body if isinstance(node, ast.FunctionDef) and node.name == "_redact_secrets"
+    )
+    namespace = {}
+    exec(compile(ast.Module(body=[redaction_function], type_ignores=[]), str(source_path), "exec"), namespace)
+
+    redacted = namespace["_redact_secrets"](
+        {"api_key": "secret-value", "hf_token": "token-value", "token_broadcast": "uniform", "max_tokens": 1024}
+    )
+
+    assert redacted["api_key"] == "<redacted>"
+    assert redacted["hf_token"] == "<redacted>"
+    assert redacted["token_broadcast"] == "uniform"
+    assert redacted["max_tokens"] == 1024
+
+
+def test_five_gpu_recipe_and_launcher_contract():
+    recipe = (PROJECT_ROOT / "recipes/Qwen3-1.7B/config_chat_regular_qrm_lora_5gpu.yaml").read_text(
+        encoding="utf-8"
+    )
+    launcher = (PROJECT_ROOT / "train_scripts/qwen3_1.7_grpo_chat.sh").read_text(encoding="utf-8")
+
+    placeholders = set(re.findall(r"\$\{([A-Z_]+)\}", recipe))
+    exported_lines = " ".join(re.findall(r"^export\s+([^\n]+)$", launcher, flags=re.MULTILINE))
+    missing_exports = sorted(variable for variable in placeholders if variable not in exported_lines)
+
+    assert not missing_exports, f"Recipe placeholders are not exported by launcher: {missing_exports}"
+    assert "advantage: studentization" in recipe
+    assert "loss_type: bnpo" in recipe
+    assert "vllm_mode: server" in recipe
+    assert "use_peft: true" in recipe
+    assert "reward_funcs:\n- qrm" in recipe
