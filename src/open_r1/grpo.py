@@ -216,7 +216,7 @@ def main(script_args, training_args, model_args):
     # Save everything else on main process
     kwargs = {
         "dataset_name": script_args.dataset_name,
-        "tags": ["open-r1"],
+        "tags": ["grpo"],
     }
     if trainer.accelerator.is_main_process:
         trainer.create_model_card(**kwargs)

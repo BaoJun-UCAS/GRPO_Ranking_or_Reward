@@ -632,7 +632,11 @@ class GRPOTrainer(Trainer):
                     base_url = args.vllm_server_base_url
                 else:
                     base_url = f"http://{args.vllm_server_host}:{args.vllm_server_port}"
-                self.vllm_client = VLLMClient(base_url=base_url, connection_timeout=args.vllm_server_timeout)
+                self.vllm_client = VLLMClient(
+                    base_url=base_url,
+                    connection_timeout=args.vllm_server_timeout,
+                    group_port=args.vllm_group_port,
+                )
                 self.vllm_client.init_communicator()
 
             elif self.vllm_mode == "colocate":
@@ -904,22 +908,27 @@ class GRPOTrainer(Trainer):
 
     def _enable_gradient_checkpointing(self, model: PreTrainedModel, args: GRPOConfig) -> PreTrainedModel:
         """Enables gradient checkpointing for the model."""
+        checkpoint_kwargs = dict(args.gradient_checkpointing_kwargs or {})
+        checkpoint_kwargs.setdefault("use_reentrant", True)
+        # Frozen PEFT weights can be repartitioned to shape [0] during
+        # non-reentrant recomputation in the pinned DeepSpeed 0.16.8 stack.
+        # https://github.com/deepspeedai/DeepSpeed/issues/4332
+        if is_peft_model(model) and is_deepspeed_zero3_enabled() and not checkpoint_kwargs["use_reentrant"]:
+            raise ValueError(
+                "PEFT + DeepSpeed ZeRO-3 requires gradient_checkpointing_kwargs.use_reentrant=true "
+                "with the pinned runtime. Non-reentrant recomputation can see partitioned, empty weights."
+            )
         # Ensure use_cache is disabled
         model.config.use_cache = False
 
         # Enable gradient checkpointing on the base model for PEFT
         if is_peft_model(model):
-            model.base_model.gradient_checkpointing_enable()
+            model.base_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs=checkpoint_kwargs)
         # Enable gradient checkpointing for non-PEFT models
         else:
-            model.gradient_checkpointing_enable()
+            model.gradient_checkpointing_enable(gradient_checkpointing_kwargs=checkpoint_kwargs)
 
-        gradient_checkpointing_kwargs = args.gradient_checkpointing_kwargs or {}
-        use_reentrant = (
-            "use_reentrant" not in gradient_checkpointing_kwargs or gradient_checkpointing_kwargs["use_reentrant"]
-        )
-
-        if use_reentrant:
+        if checkpoint_kwargs["use_reentrant"]:
             model.enable_input_require_grads()
 
         return model
@@ -1373,7 +1382,9 @@ class GRPOTrainer(Trainer):
         # Identify sequences that terminated with EOS and log their lengths
         agg_terminated_with_eos = self.accelerator.gather(is_eos.any(dim=1))
         term_completion_lengths = agg_completion_lengths[agg_terminated_with_eos]
-        clipped_completions_ratio = 1 - len(term_completion_lengths) / len(completion_lengths)
+        # Both numerator and denominator must cover all ranks. Dividing the
+        # global EOS count by a local batch size can produce negative ratios.
+        clipped_completions_ratio = 1 - len(term_completion_lengths) / len(agg_completion_lengths)
         self._metrics[mode]["completions/clipped_ratio"].append(clipped_completions_ratio)
         if len(term_completion_lengths) == 0:  # edge case where no terminated sequences are found
             term_completion_lengths = torch.zeros(1, device=device)

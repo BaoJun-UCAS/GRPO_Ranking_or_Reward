@@ -2,6 +2,17 @@
 
 本项目建议把“代码与小型配置”放在 GitHub，把模型权重、checkpoint、数据集、completion、judge cache 和完整运行结果放在服务器大盘、Hugging Face Hub 或对象存储。仓库已经提供 `.gitignore` 防止常见的大文件和密钥被误提交。
 
+如果已克隆本仓库，先执行 `git remote -v` 查看现有远端，无需再次创建仓库或重命名远端。提交前的部署检查入口为：
+
+```bash
+python -m pip install -r requirements-test.txt
+make test
+DATASET_NAME=example/UltraChat-200k make dry-run
+git diff --check
+```
+
+测试和 dry-run 不加载模型。远端 CI 使用同一套 CPU 测试；GPU/NCCL/实际训练验收需单独记录，不能用 CI 通过代替。
+
 ## 1. 首次上传前检查
 
 在项目根目录执行：
@@ -17,7 +28,7 @@ git grep -nE '(sk-[A-Za-z0-9_-]{16,}|api[_-]?key[[:space:]]*=[[:space:]]*[^$])' 
 
 - `.env`、API key、Hugging Face token、W&B key；
 - `checkpoint-*`、`*.safetensors`、`pytorch_model*.bin`；
-- `gopo_runs/`、completion、reward data、judge cache；
+- `grpo_runs/`、completion、reward data、judge cache；
 - 原始数据集或个人路径中的隐私信息。
 
 如果密钥曾经进入 Git 历史，仅删除当前文件不够：应立即吊销并重建密钥，再清理历史。首轮最稳妥的是先把 GitHub 仓库设为 private。
@@ -25,13 +36,13 @@ git grep -nE '(sk-[A-Za-z0-9_-]{16,}|api[_-]?key[[:space:]]*=[[:space:]]*[^$])' 
 ## 2. 在 GitHub 网页创建空仓库
 
 1. 登录 GitHub，打开 `https://github.com/new`。
-2. Repository name 可设为 `gopo-reproduction` 或你的论文项目名。
+2. Repository name 设为 `grpo`。
 3. 选择 Private（准备开源时再改 Public）。
 4. 不要勾选初始化 README、`.gitignore` 或 License；本地项目已经包含这些文件，远端初始化会额外制造一次无关历史。
 5. 点击 Create repository，复制页面给出的 SSH 地址，例如：
 
 ```text
-git@github.com:YOUR_NAME/gopo-reproduction.git
+git@github.com:YOUR_NAME/grpo.git
 ```
 
 ## 3. 配置 Git 身份和 SSH
@@ -72,7 +83,7 @@ git remote -v
 把新仓库作为名为 `publication` 的第二远端：
 
 ```bash
-git remote add publication git@github.com:YOUR_NAME/gopo-reproduction.git
+git remote add publication git@github.com:YOUR_NAME/grpo.git
 git remote -v
 ```
 
@@ -108,13 +119,13 @@ git remote -v
 只有在你明确不想保留上游 commit 历史时使用。不要在当前工作目录删除 `.git`。在服务器另建目录并复制已跟踪文件：
 
 ```bash
-mkdir -p /data/$USER/repos/gopo-reproduction
-git archive --format=tar HEAD | tar -x -C /data/$USER/repos/gopo-reproduction
-cd /data/$USER/repos/gopo-reproduction
+mkdir -p "$HOME/repos/grpo"
+git archive --format=tar HEAD | tar -x -C "$HOME/repos/grpo"
+cd "$HOME/repos/grpo"
 git init -b main
 git add .
-git commit -m "chore: initialize GOPO reproduction project"
-git remote add origin git@github.com:YOUR_NAME/gopo-reproduction.git
+git commit -m "chore: initialize GRPO project"
+git remote add origin git@github.com:YOUR_NAME/grpo.git
 git push -u origin main
 ```
 
@@ -136,14 +147,14 @@ git push -u origin main
 ```bash
 git switch main
 git pull --ff-only origin main
-git switch -c experiment/gopo-ranking-ultrachat
+git switch -c experiment/grpo-ranking-ultrachat
 # 修改并验证
 git add <明确的文件列表>
-git commit -m "exp: add UltraChat GOPO ranking run"
-git push -u origin experiment/gopo-ranking-ultrachat
+git commit -m "exp: add UltraChat ranking GRPO run"
+git push -u origin experiment/grpo-ranking-ultrachat
 ```
 
-然后从 GitHub 创建 Pull Request，等待 `lightweight-ci` 通过后合并。CI 只做 Python/shell 语法和空白检查，不会下载模型或占用 GPU。
+然后从 GitHub 创建 Pull Request，等待 `lightweight-ci` 通过后合并。CI 检查配置解析、服务协议、进程生命周期以及 Python/shell 语法，不会下载模型或占用 GPU。
 
 ## 7. 保护 main 与发布版本
 

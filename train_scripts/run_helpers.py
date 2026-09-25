@@ -1,0 +1,191 @@
+"""CPU-only YAML configuration and port checks for the GRPO Bash launcher.
+
+Parsing before substitution preserves paths containing YAML punctuation as
+strings. Only documented launch variables are substituted; unrelated environment
+values are never expanded into the configuration.
+"""
+
+import argparse
+import math
+import os
+from pathlib import Path
+import re
+import socket
+
+import yaml
+
+
+INTEGER_VARIABLES = {
+    "VLLM_HTTP_PORT", "VLLM_GROUP_PORT", "REWARD_BATCH_SIZE", "MAX_PROMPT_LENGTH",
+    "MAX_COMPLETION_LENGTH", "GENERATION_BATCH_SIZE", "GRADIENT_ACCUMULATION_STEPS",
+    "MAX_STEPS", "NUM_GENERATIONS", "PER_DEVICE_TRAIN_BATCH_SIZE",
+}
+STRING_VARIABLES = {"RUN_NAME", "OUTPUT_DIR", "DATASET_NAME", "MODEL_NAME"}
+PLACEHOLDER = re.compile(r"\$\{([A-Za-z_][A-Za-z_0-9]*)\}")
+
+
+def substitute(value, variables):
+    if isinstance(value, dict):
+        return {key: substitute(item, variables) for key, item in value.items()}
+    if isinstance(value, list):
+        return [substitute(item, variables) for item in value]
+    if not isinstance(value, str):
+        return value
+
+    def lookup(match):
+        name = match.group(1)
+        if name not in variables:
+            raise ValueError(f"Unsupported or unset template variable: {name}")
+        return variables[name]
+
+    match = PLACEHOLDER.fullmatch(value)
+    if match:
+        return lookup(match)
+    return PLACEHOLDER.sub(lambda match: str(lookup(match)), value)
+
+
+def positive_int(name, env):
+    value = env[name]
+    if not re.fullmatch(r"[1-9][0-9]*", value):
+        raise ValueError(f"{name} must be a positive integer; got {value!r}")
+    return int(value)
+
+
+def resolve(config_path, accelerate_path, env):
+    variables = {key: env[key] for key in STRING_VARIABLES}
+    variables.update({key: positive_int(key, env) for key in INTEGER_VARIABLES})
+    gpu_text = env["TRAIN_GPUS"]
+    if not re.fullmatch(r"[0-9]+(?:,[0-9]+)*", gpu_text):
+        raise ValueError("TRAIN_GPUS must be a comma-separated list of GPU indices")
+    gpu_ids = [int(item) for item in gpu_text.split(",")]
+    if len(set(gpu_ids)) != len(gpu_ids):
+        raise ValueError("TRAIN_GPUS contains duplicate GPU indices")
+    if int(env["VLLM_GPU"]) in gpu_ids:
+        raise ValueError("VLLM_GPU must not also appear in TRAIN_GPUS")
+    expected_batch = len(gpu_ids) * variables["PER_DEVICE_TRAIN_BATCH_SIZE"] * variables["GRADIENT_ACCUMULATION_STEPS"]
+    if variables["GENERATION_BATCH_SIZE"] != expected_batch:
+        raise ValueError(
+            "GENERATION_BATCH_SIZE must equal training GPU count × per-device batch "
+            f"× gradient accumulation ({expected_batch})"
+        )
+    if variables["NUM_GENERATIONS"] < 2 or expected_batch % variables["NUM_GENERATIONS"]:
+        raise ValueError("NUM_GENERATIONS must be at least 2 and divide GENERATION_BATCH_SIZE")
+    if variables["MAX_PROMPT_LENGTH"] + variables["MAX_COMPLETION_LENGTH"] > positive_int("VLLM_MAX_MODEL_LEN", env):
+        raise ValueError("VLLM_MAX_MODEL_LEN must cover MAX_PROMPT_LENGTH + MAX_COMPLETION_LENGTH")
+    memory = float(env["VLLM_GPU_MEMORY_UTILIZATION"])
+    if not math.isfinite(memory) or not 0 < memory <= 1:
+        raise ValueError("VLLM_GPU_MEMORY_UTILIZATION must be in (0, 1]")
+    ports = [positive_int(key, env) for key in ("VLLM_HTTP_PORT", "PORT", "VLLM_GROUP_PORT")]
+    if max(ports) > 65535 or len(set(ports)) != len(ports):
+        raise ValueError("VLLM_HTTP_PORT, PORT and VLLM_GROUP_PORT must be distinct ports in 1..65535")
+    for key in ("DRY_RUN", "MERGE_AFTER_TRAINING"):
+        if env[key] not in ("0", "1"):
+            raise ValueError(f"{key} must be 0 or 1")
+    if env.get("VLLM_USE_V1", "0") != "0":
+        raise ValueError("This pinned TRL/vLLM service requires VLLM_USE_V1=0")
+    if env.get("VLLM_WORKER_MULTIPROC_METHOD", "spawn") != "spawn":
+        raise ValueError("VLLM_WORKER_MULTIPROC_METHOD must be spawn for CUDA workers")
+
+    with config_path.open(encoding="utf-8") as stream:
+        config = substitute(yaml.safe_load(stream), variables)
+    with accelerate_path.open(encoding="utf-8") as stream:
+        accelerate = yaml.safe_load(stream)
+    if not isinstance(config, dict) or not isinstance(accelerate, dict):
+        raise ValueError("Training and Accelerate YAML files must contain mappings")
+    # A custom template must match the launch plan, so server and trainer cannot
+    # silently load different models or write into unrelated directories.
+    expected = {
+        "model_name_or_path": variables["MODEL_NAME"],
+        "dataset_name": variables["DATASET_NAME"],
+        "output_dir": variables["OUTPUT_DIR"],
+        "generation_batch_size": expected_batch,
+        "per_device_train_batch_size": variables["PER_DEVICE_TRAIN_BATCH_SIZE"],
+        "gradient_accumulation_steps": variables["GRADIENT_ACCUMULATION_STEPS"],
+        "num_generations": variables["NUM_GENERATIONS"],
+        "max_prompt_length": variables["MAX_PROMPT_LENGTH"],
+        "max_completion_length": variables["MAX_COMPLETION_LENGTH"],
+        "reward_batch_size": variables["REWARD_BATCH_SIZE"],
+        "max_steps": variables["MAX_STEPS"],
+        "use_vllm": True,
+        "vllm_mode": "server",
+        "vllm_server_base_url": f"http://127.0.0.1:{ports[0]}",
+        "vllm_group_port": ports[2],
+    }
+    for key, value in expected.items():
+        if config.get(key) != value:
+            raise ValueError(f"Training template {key} must resolve to {value!r}; got {config.get(key)!r}")
+    if accelerate.get("num_machines", 1) != 1:
+        raise ValueError("This launcher supports a single machine; use a separate launcher for multi-node training")
+    if accelerate.get("distributed_type") != "DEEPSPEED":
+        raise ValueError("This launcher expects an Accelerate DEEPSPEED configuration")
+    if accelerate.get("machine_rank", 0) != 0:
+        raise ValueError("Single-machine training requires machine_rank=0")
+    if accelerate.get("use_cpu", False):
+        raise ValueError("Accelerate use_cpu must be false for this CUDA training launcher")
+    if (
+        config.get("use_peft")
+        and config.get("gradient_checkpointing")
+        and accelerate.get("deepspeed_config", {}).get("zero_stage") == 3
+        and not (config.get("gradient_checkpointing_kwargs") or {}).get("use_reentrant", True)
+    ):
+        raise ValueError("PEFT + ZeRO-3 requires gradient_checkpointing_kwargs.use_reentrant=true with the pinned runtime")
+    checkpoint = env.get("RESUME_FROM_CHECKPOINT")
+    if checkpoint:
+        checkpoint_path = Path(checkpoint).expanduser().resolve()
+        if not checkpoint_path.is_dir():
+            raise ValueError(f"RESUME_FROM_CHECKPOINT must be an existing directory: {checkpoint_path}")
+        config["resume_from_checkpoint"] = str(checkpoint_path)
+    accelerate["num_processes"] = len(gpu_ids)
+    accelerate["gpu_ids"] = "all"  # CUDA_VISIBLE_DEVICES selects physical GPUs.
+    return config, accelerate
+
+
+def check_ports(ports):
+    # Detect any listener, including one that never responds to /health/.
+    # Probes are short-lived; the real server still reports races after this.
+    for port in ports:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                probe.bind(("127.0.0.1", port))
+        except OSError as error:
+            raise ValueError(f"Local port {port} is unavailable: {error}. Choose another port; no process was stopped.") from error
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    config_parser = commands.add_parser("resolve")
+    config_parser.add_argument("--config", type=Path, required=True)
+    config_parser.add_argument("--accelerate-config", type=Path, required=True)
+    config_parser.add_argument("--write", action="store_true")
+    ports_parser = commands.add_parser("check-ports")
+    ports_parser.add_argument("ports", type=int, nargs="+")
+    args = parser.parse_args()
+    try:
+        if args.command == "check-ports":
+            check_ports(args.ports)
+            return
+        config, accelerate = resolve(args.config, args.accelerate_config, os.environ)
+        if args.write:
+            destination = Path(os.environ["OUTPUT_DIR"]) / "config"
+            for name, content in (("resolved_training_config.yaml", config), ("accelerate_config.yaml", accelerate)):
+                with (destination / name).open("w", encoding="utf-8") as stream:
+                    yaml.safe_dump(content, stream, sort_keys=False, allow_unicode=True)
+        else:
+            print(f"Plan: vLLM GPU {os.environ['VLLM_GPU']}; training GPUs {os.environ['TRAIN_GPUS']}")
+            print(f"Training processes: {accelerate['num_processes']}; generation batch: {config['generation_batch_size']}")
+            print(f"Ports: HTTP={os.environ['VLLM_HTTP_PORT']}, training={os.environ['PORT']}, weight sync={os.environ['VLLM_GROUP_PORT']}")
+            print(f"Output: {os.environ['OUTPUT_DIR']}")
+            print(f"HF_HOME: {os.environ['HF_HOME']}; HF_HUB_CACHE: {os.environ['HF_HUB_CACHE']}")
+            if os.environ["DRY_RUN"] == "1":
+                print("Resolved training configuration:")
+                print(yaml.safe_dump(config, sort_keys=False, allow_unicode=True), end="")
+                print("Resolved Accelerate configuration:")
+                print(yaml.safe_dump(accelerate, sort_keys=False, allow_unicode=True), end="")
+    except (KeyError, ValueError, OSError, yaml.YAMLError) as error:
+        parser.exit(2, f"Configuration error: {error}\n")
+
+
+if __name__ == "__main__":
+    main()

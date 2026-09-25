@@ -183,6 +183,10 @@ class GRPOConfig(trl.GRPOConfig):
         default=None,
         metadata={"help": "Batch size for neural network reward models. If None, processes all samples at once"},
     )
+    vllm_group_port: int = field(
+        default=51216,
+        metadata={"help": "NCCL weight-sync port for vLLM server mode; use a distinct port per experiment."},
+    )
 
 
 @dataclass

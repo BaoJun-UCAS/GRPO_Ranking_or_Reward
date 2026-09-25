@@ -1,4 +1,40 @@
-.PHONY: style quality
+.DEFAULT_GOAL := help
+.PHONY: help doctor doctor-cuda env-create download-models cache smoke train dry-run logs install style quality test slow_test evaluate
+
+PYTHON ?= python
+GRPO := $(PYTHON) scripts/grpo.py
+
+help:
+	@$(GRPO) --help
+	@echo 'Make shortcuts: env-create install doctor doctor-cuda download-models cache smoke train dry-run logs test'
+	@echo 'Set DATASET_NAME, VLLM_GPU, TRAIN_GPUS, GRPO_OUTPUT_ROOT and HF_HOME as needed; see docs/ENVIRONMENT_SETUP_ZH.md'
+
+doctor:
+	$(GRPO) doctor
+
+doctor-cuda:
+	$(GRPO) doctor --cuda
+
+env-create:
+	conda env create -f environment.yml
+
+download-models:
+	$(GRPO) download
+
+cache:
+	$(GRPO) cache
+
+smoke:
+	$(GRPO) smoke
+
+train:
+	$(GRPO) train
+
+dry-run:
+	$(GRPO) smoke --dry-run
+
+logs:
+	$(GRPO) logs --follow
 
 # make sure to test the local checkout in scripts and not the pre-installed one (don't use quotes!)
 export PYTHONPATH = src
@@ -8,12 +44,9 @@ check_dirs := src tests
 
 # dev dependencies
 install:
-	uv venv openr1 --python 3.11
-	. openr1/bin/activate && uv pip install --upgrade pip && \
-	uv pip install vllm==0.8.5.post1 && \
-	uv pip install setuptools && \
-	uv pip install flash-attn --no-build-isolation && \
-	GIT_LFS_SKIP_SMUDGE=1 uv pip install -e ".[dev]"
+	$(PYTHON) -m pip install -e '.[judge]'
+	$(PYTHON) -m pip install flash-attn==2.7.4.post1 --no-build-isolation
+	$(PYTHON) -m pip check
 
 style:
 	ruff format --line-length 119 --target-version py310 $(check_dirs) setup.py
@@ -25,7 +58,7 @@ quality:
 	flake8 --max-line-length 119 $(check_dirs) setup.py
 
 test:
-	python -m pytest -sv --ignore=tests/slow/ tests/
+	$(PYTHON) -m pytest -q --ignore=tests/slow/ tests/
 
 slow_test:
 	python -m pytest -sv -vv tests/slow/

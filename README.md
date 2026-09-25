@@ -1,53 +1,114 @@
-# GOPO
+# GRPO
 
-GRPO/GOPO training framework for language models.
+GRPO training framework for language-model ranking and reward experiments.
 
-For the reproducible five-GPU GRPO baseline, see:
+Deployment starts with a CPU-only environment check and a two-step smoke test.
+The default experiment uses Qwen3-1.7B, UltraChat, and a QRM reward model with
+one dedicated vLLM GPU plus configurable ZeRO-3 training GPUs.
+
+The current `studentization` recipe is an experimental baseline, not a verified
+paper-exact reproduction of original GRPO: it uses `loss_type: bnpo` and a custom
+trainer. On 2026-09-24, the 1+4 RTX 4090 smoke test passed readiness, generation,
+weight synchronization, two optimizer steps, checkpoint/adapter saving, and LoRA
+merging. The merged model was reloaded and generated tokens successfully.
+This validates the short smoke configuration, not long-run convergence or the
+memory budget of larger recipes. See:
 
 - [Experiment configuration and change log](EXPERIMENT_GRPO_5GPU.md)
 - [Chinese environment setup guide](docs/ENVIRONMENT_SETUP_ZH.md)
+- [Deployment failures, evidence, and troubleshooting](docs/DEPLOYMENT_TROUBLESHOOTING_ZH.md)
 - [Chinese GitHub project management guide](docs/GITHUB_PROJECT_MANAGEMENT_ZH.md)
 
 ## Installation
 
-```shell
-conda create -n rl --python 3.11 && conda activate rl && pip install --upgrade pip
+Run from the repository root. Choose a writable disk with room for temporary
+downloads, the Conda environment, model caches, and training outputs:
+
+```bash
+export GRPO_WORK_DIR="$HOME/grpo-work"  # Change to your large writable disk.
+mkdir -p "$GRPO_WORK_DIR/tmp" "$GRPO_WORK_DIR/cache/pip" "$GRPO_WORK_DIR/runs"
+export TMPDIR="$GRPO_WORK_DIR/tmp"
+export PIP_CACHE_DIR="$GRPO_WORK_DIR/cache/pip"
+export GRPO_CACHE_ROOT="$GRPO_WORK_DIR/cache/grpo"
+export HF_HOME="$GRPO_CACHE_ROOT/huggingface"
+export GRPO_OUTPUT_ROOT="$GRPO_WORK_DIR/runs"
+
+conda env create -f environment.yml
+conda activate grpo
 ```
 
-Next, install vLLM and FlashAttention:
+The environment file installs PyTorch 2.6.0, vLLM 0.8.5.post1, CUDA 12.4
+development tools, the editable GRPO package, and training/evaluation dependencies. Once that command
+succeeds, install FlashAttention so its build can see PyTorch. A source build
+needs the CUDA Toolkit (`nvcc`), a C++ compiler, and enough host memory;
+`nvidia-smi` alone does not establish that a Toolkit is installed.
 
-```shell
-pip install vllm==0.8.5.post1
-pip install setuptools && pip install flash-attn==2.7.4.post1 --no-build-isolation
+```bash
+nvcc --version
+export CUDA_HOME="$CONDA_PREFIX"  # For the Toolkit installed by environment.yml.
+MAX_JOBS=8 python -m pip install flash-attn==2.7.4.post1 --no-build-isolation
+python -m pip check
+python scripts/grpo.py doctor
 ```
 
-This will also install PyTorch `v2.6.0` and it is **very important** to use this version since the vLLM binaries are compiled for it. You can then install the remaining dependencies for your specific use case via `pip install -e .[LIST OF MODES]`. For most contributors, we recommend:
+Keep the pinned PyTorch/vLLM/TRL versions together. `pip check` only checks
+installed dependency metadata; it does not prove that CUDA, imports, or training
+work. `doctor` checks local prerequisites without initializing CUDA. Use
+`python scripts/grpo.py doctor --cuda` when the selected GPUs are available.
+
+Contributors can install the development extras with:
 
 ```shell
-GIT_LFS_SKIP_SMUDGE=1 pip install -e ".[dev]"
+GIT_LFS_SKIP_SMUDGE=1 python -m pip install -e ".[dev]"
 ```
 
-Next, log into your Hugging Face and Weights and Biases accounts as follows:
+## Quick commands
 
-```shell
-huggingface-cli login
-wandb login
+All shortcuts use the active Python environment and work without `make` via
+`python scripts/grpo.py --help`.
+
+| Task | Command | GPU use |
+| --- | --- | --- |
+| Create the Conda environment | `make env-create` | None |
+| Check environment, paths, and tools | `make doctor` | No CUDA initialization |
+| Check CUDA explicitly | `make doctor-cuda` | CUDA initialization |
+| Download policy and reward models | `make download-models` | None; uses network and disk |
+| Inspect model cache and partial files | `make cache` | None |
+| Preview smoke plan and resolved configuration | `make dry-run` | None; no run directory created |
+| Run two optimizer steps | `make smoke` | Starts vLLM and training |
+| Run the configured experiment | `make train` | Starts vLLM and training |
+| Follow latest vLLM log | `make logs` | None |
+| Run lightweight tests | `make test` | None |
+
+For the CPU test suite alone, install `requirements-test.txt`; the full training
+stack is not required for those tests.
+
+Set the dataset and GPU assignment before the launch commands:
+
+```bash
+export DATASET_NAME=your_org/UltraChat-200k
+export VLLM_GPU=0
+export TRAIN_GPUS=1,2,3,4
+python scripts/grpo.py smoke --dry-run
+python scripts/grpo.py download
+# Run only after the selected GPUs are available:
+python scripts/grpo.py smoke
 ```
 
-## Environment Variables
-
-Set your HuggingFace username for dataset paths:
-
-```shell
-export HF_USERNAME=your_username
-export HF_TOKEN=your_huggingface_token  # Required for pushing datasets
-```
-
-You can add these to your `~/.bashrc` for persistence.
+GPU numbers are examples, not a reservation or a topology recommendation for
+every server. Use `nvidia-smi topo -m` and local scheduling rules to select them.
+For the previously inspected eight-4090 host, training GPUs `4,5,6,7` shared
+NUMA 1; this fact does not apply automatically to another host.
 
 ## Data Preprocessing
 
-Preprocessing scripts are located in the `preprocess_data/` folder. These scripts download, process, and push datasets to your HuggingFace Hub.
+Preprocessing scripts in `preprocess_data/` download, process, and **upload**
+datasets to your Hugging Face account. Skip this section if `DATASET_NAME`
+already points to a compatible dataset with `train`/`val` splits and a `prompt`
+column. Set `HF_USERNAME` and a write-enabled `HF_TOKEN` before preprocessing;
+keep tokens out of scripts and Git. Public model downloads do not require a
+write token. W&B is offline by default; `wandb login` is needed only for online
+tracking.
 
 ### UltraChat Dataset (Chat)
 
@@ -75,31 +136,59 @@ Merges `allenai/tulu-3-sft-personas-instruction-following` (train) with `google/
 
 ## Training
 
-Training scripts are in the `train_scripts/` folder. The default GRPO Chat launcher uses one dedicated vLLM GPU plus four ZeRO-3 training GPUs. The recommended assignment for the inspected seven-GPU server is GPU 0 for vLLM and GPUs 3,4,5,6 for training.
+The Chat launcher starts `python -m open_r1.vllm_serve`, waits for a bounded
+readiness check, then starts ZeRO-3 training. The local service preserves the
+TRL 0.18 client protocol and avoids that version's extra outer model process.
+Do not replace it with `trl vllm-serve` or a generic OpenAI-compatible vLLM
+server: the trainer also requires weight-synchronization endpoints.
 
 ### Running Training
 
 ```shell
-# GRPO training (studentized/original advantage, LoRA, UltraChat + QRM)
-export HF_USERNAME=your_username
-bash train_scripts/qwen3_1.7_grpo_chat.sh
+# Studentized experimental baseline (LoRA, UltraChat + QRM)
+export DATASET_NAME=your_org/UltraChat-200k
+python scripts/grpo.py train
 
-# GOPO training (ranking advantage)
-bash train_scripts/qwen3_1.7_gopo_chat.sh
+# Ranking GRPO training (ranking advantage)
+bash train_scripts/qwen3_1.7_grpo_ranking_chat.sh
 ```
 
 ### Customizing Training
 
-1. **Change GPU assignment without editing files**:
-   `VLLM_GPU=0 TRAIN_GPUS=3,4,5,6 bash train_scripts/qwen3_1.7_grpo_chat.sh`
-2. **Change result location**:
-   `GOPO_OUTPUT_ROOT=/your/large/disk/gopo_runs bash train_scripts/qwen3_1.7_grpo_chat.sh`
-3. **Resume an existing run**:
-   `RUN_DIR=/absolute/path/to/run bash train_scripts/qwen3_1.7_grpo_chat.sh`
-4. **Use a different preprocessed dataset**:
-   set `DATASET_NAME`; otherwise `${HF_USERNAME}/UltraChat-200k` is used.
+| Variable | Purpose |
+| --- | --- |
+| `VLLM_GPU`, `TRAIN_GPUS` | One server GPU and a disjoint, nonempty list of training GPUs; process count is inferred |
+| `DATASET_NAME` | Dataset ID; alternatively set `HF_USERNAME` for its `UltraChat-200k` dataset |
+| `MODEL_NAME`, `CONFIG_FILE`, `ACCELERATE_CONFIG` | Model and recipe selection; changing the model can also require LoRA/reward adjustments |
+| `GRPO_OUTPUT_ROOT`, `RUN_DIR` | Output root, or an explicit new run directory; existing directories are not overwritten |
+| `RESUME_FROM_CHECKPOINT` | Explicit checkpoint path for resuming into a new run directory |
+| `GRPO_CACHE_ROOT`, `HF_HOME`, `HF_HUB_CACHE` | Cache location; explicit Hugging Face settings take precedence |
+| `NUM_GENERATIONS`, `PER_DEVICE_TRAIN_BATCH_SIZE`, `GRADIENT_ACCUMULATION_STEPS` | Batch configuration; generation batch is derived unless explicitly supplied |
+| `MAX_STEPS`, `MAX_PROMPT_LENGTH`, `MAX_COMPLETION_LENGTH`, `REWARD_BATCH_SIZE` | Training scale and memory controls |
+| `VLLM_HTTP_PORT`, `PORT`, `VLLM_GROUP_PORT` | HTTP, training rendezvous, and weight-sync ports (defaults: 8000, 29501, 51216); use three distinct ports per experiment |
 
-The launcher stores the resolved YAML, hardware snapshot, terminal logs, reward records, checkpoints, final adapter, and merged evaluation model under one timestamped run directory. W&B defaults to offline mode; set `WANDB_MODE=online` to upload metrics.
+The default output root is `grpo_runs/` inside the repository. Without explicit
+cache settings, models use `${XDG_CACHE_HOME:-$HOME/.cache}/grpo/huggingface`.
+The launcher stores the resolved YAML, hardware snapshot, terminal logs, reward
+records, checkpoints, final adapter, and merged evaluation model in one run
+directory. W&B defaults to offline mode; set `WANDB_MODE=online` to upload
+metrics. No `.env` file is loaded implicitly.
+
+The smoke shortcut defaults to two steps and skips LoRA merging; use
+`MERGE_AFTER_TRAINING=1 python scripts/grpo.py smoke` to include it. Explicit
+environment overrides are respected, so clear stale training values before a
+smoke run. To resume while preserving the original run's evidence:
+
+```bash
+RESUME_FROM_CHECKPOINT=/path/to/old-run/checkpoint-100 python scripts/grpo.py train
+```
+
+Follow the log for a specific run:
+
+```bash
+python scripts/grpo.py logs --run-dir /path/to/run --service vllm --follow
+python scripts/grpo.py logs --run-dir /path/to/run --service training --follow
+```
 
 ### Available Recipes
 
@@ -115,26 +204,9 @@ Recipes are in `recipes/Qwen3-1.7B/`:
 | `config_if_regular_skywork-8b_seed42.yaml` | IF-Datasets | Regular | Skywork-8B |
 | `config_if_ranking_skywork-8b_seed42.yaml` | IF-Datasets | Ranking | Skywork-8B |
 
-### Example: Custom Training Run
-
-```shell
-export CUDA_VISIBLE_DEVICES=0,1,2,3
-export PORT=29500
-export HF_USERNAME=your_username
-
-CONFIG_FILE="recipes/Qwen3-1.7B/config_tldr_ranking_skywork-8b_seed42.yaml"
-PROCESSED_CONFIG=$(mktemp)
-envsubst < "$CONFIG_FILE" > "$PROCESSED_CONFIG"
-
-ACCELERATE_LOG_LEVEL=info accelerate launch \
-    --config_file recipes/accelerate_configs/zero3_4gpus.yaml \
-    --main_process_port $PORT \
-    --num_processes=4 src/open_r1/grpo.py \
-    --config "$PROCESSED_CONFIG"
-
-rm -f "$PROCESSED_CONFIG"
-```
-
+The legacy full-parameter recipes remain for research. They are not validated
+interchangeably with the Chat deployment launcher; check their vLLM mode, reward
+function, model-specific options, and memory requirements before adapting one.
 
 ## Generation
 
@@ -194,7 +266,7 @@ python evaluate/bootstrap_judge.py \
     --completions1 <path/to/model1_completions.json> \
     --completions2 <path/to/model2_completions.json> \
     --api-provider deepseek \
-    --judge-model deepseek-flash \
+    --judge-model YOUR_AVAILABLE_JUDGE_MODEL \
     --thinking-mode disabled \
     --N 100 \
     --B 1000 \
@@ -202,12 +274,16 @@ python evaluate/bootstrap_judge.py \
     --no-ties
 ```
 
-Set `DEEPSEEK_API_KEY` in the environment. Do not place the key in a recipe or shell script. The evaluator sends exactly `N` unique pairs to the API, writes each judgment immediately to an append-only cache, and performs all `B` bootstrap resamples locally. An interrupted run therefore resumes without paying for completed judgments again.
+This optional stage calls a paid external API. Verify the provider's current
+model identifiers, API compatibility, and prices before running it. Set
+`DEEPSEEK_API_KEY` in the environment rather than a recipe or script. The
+evaluator judges `N` unique pairs, writes successful judgments to an append-only
+cache, and performs `B` bootstrap resamples locally. Cached pairs are reused;
+retries and failed responses can still cause additional API requests.
 
 For the complete post-training workflow, including base-model and trained-model generation, run:
 
 ```shell
-export DEEPSEEK_API_KEY=your_key
 EVAL_GPU=0 bash evaluate/run_grpo_chat_deepseek.sh /absolute/path/to/training-run
 ```
 

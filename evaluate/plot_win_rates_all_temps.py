@@ -576,9 +576,9 @@ def plot_multi_model_temperatures(all_model_data: Dict[str, Dict[float, Tuple[Di
 
         # Formatting
         ax.set_xlabel('Training Steps (Checkpoint)', fontsize=pc.FONT_SIZE_AXIS_LABEL, fontweight=pc.FONT_WEIGHT_AXIS_LABEL)
-        ax.set_ylabel(f'GOPO {metric_name.capitalize()} Win Rate', fontsize=pc.FONT_SIZE_AXIS_LABEL, fontweight=pc.FONT_WEIGHT_AXIS_LABEL)
+        ax.set_ylabel(f'GRPO {metric_name.capitalize()} Win Rate', fontsize=pc.FONT_SIZE_AXIS_LABEL, fontweight=pc.FONT_WEIGHT_AXIS_LABEL)
 
-        title = f'GOPO Win Rates ({task.upper()})'
+        title = f'GRPO Win Rates ({task.upper()})'
         ax.set_title(title, fontsize=pc.FONT_SIZE_TITLE, fontweight=pc.FONT_WEIGHT_TITLE, pad=20)
 
         ax.set_xticks(np.arange(len(checkpoints)))

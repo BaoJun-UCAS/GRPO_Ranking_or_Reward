@@ -182,7 +182,9 @@ eval_results/
 results/
 
 # Local experiment artifacts (never commit model weights, caches, or API outputs)
+grpo_runs/
 gopo_runs/
+grpo_cache/
 completions_n*/
 **/checkpoint-*/
 **/merged_model/

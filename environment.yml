@@ -1,0 +1,48 @@
+# Version-pinned core environment for the Qwen3-1.7B GRPO recipes (Linux).
+# Transitive dependencies are not a full lockfile; each run records pip freeze.
+#
+# Run these commands from the repository root:
+#   Choose a writable large disk, then export TMPDIR and PIP_CACHE_DIR there.
+#   See docs/ENVIRONMENT_SETUP_ZH.md for the complete setup sequence.
+#   conda env create -f environment.yml
+#   conda activate grpo
+#   python -m pip install flash-attn==2.7.4.post1 --no-build-isolation
+#   python -m pip check
+#
+# FlashAttention is intentionally installed after this file: its build step must
+# be able to import the already-installed PyTorch 2.6.0 package. The vLLM wheel
+# below is built for the same PyTorch/CUDA 12.4 combination.
+
+name: grpo
+
+channels:
+  - nvidia/label/cuda-12.4.1
+  - conda-forge
+  - nodefaults
+
+dependencies:
+  - python=3.11
+  - pip>=24,<26
+  - setuptools>=75
+  - wheel
+  - packaging>=24
+  - ninja
+  - git
+  - git-lfs
+  - curl
+  - gettext
+  - libaio
+  # DeepSpeed's CUDA op builder and FlashAttention need nvcc plus development
+  # headers, even when torch and flash-attn were installed as binary wheels.
+  # These are user-space tools; this does not install/replace the GPU driver.
+  - cuda-nvcc=12.4
+  - cuda-libraries-dev=12.4
+  - cuda-nvtx=12.4
+  - cuda-cupti=12.4
+  - pip:
+      # Pin the binary compatibility boundary before installing the editable
+      # project and its training/evaluation dependencies.
+      - torch==2.6.0
+      - numpy==1.26.4
+      - vllm==0.8.5.post1
+      - -e .[judge]

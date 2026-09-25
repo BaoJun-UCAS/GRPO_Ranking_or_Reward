@@ -22,13 +22,13 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Install lightweight test dependency
-        run: python -m pip install pytest
-      - name: Run dependency-free tests
-        run: python -m pytest -q tests/test_project_structure.py
+      - name: Install CPU-only deployment test dependencies
+        run: python -m pip install -r requirements-test.txt
+      - name: Test deployment, lifecycle and server protocol without GPUs
+        run: PYTHONPATH=src python -m pytest -q tests/
       - name: Check shell syntax
-        run: bash -n train_scripts/qwen3_1.7_grpo_chat.sh evaluate/run_grpo_chat_deepseek.sh
+        run: |
+          for script in train_scripts/*.sh evaluate/*.sh; do bash -n "$script"; done
       - name: Check whitespace errors
-        run: git diff --check HEAD^
+        run: git show --format= --check HEAD
         if: github.event_name == 'push' && github.event.before != '0000000000000000000000000000000000000000'
-
