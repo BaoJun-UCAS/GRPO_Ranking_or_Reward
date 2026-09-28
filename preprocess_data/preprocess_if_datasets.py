@@ -31,11 +31,11 @@ test_dataset = test_dataset.rename_column("kwargs", "kwargs_ifeval")
 
 
 # add empty columns with None values to allow proper casting
-# For train dataset: add instruction_id_list_ifeval and kwargs_ifeval 
+# For train dataset: add instruction_id_list_ifeval and kwargs_ifeval
 train_dataset = train_dataset.add_column("instruction_id_list_ifeval", [None for _ in range(len(train_dataset))])
 train_dataset = train_dataset.add_column("kwargs_ifeval", [None for _ in range(len(train_dataset))])
 
-# For test dataset: add messages and constraints 
+# For test dataset: add messages and constraints
 test_dataset = test_dataset.add_column("messages", [None for _ in range(len(test_dataset))])
 test_dataset = test_dataset.add_column("constraints", [None for _ in range(len(test_dataset))])
 
@@ -47,7 +47,7 @@ test_features = test_dataset.features
 # Create unified features schema
 unified_features = Features({
     'id': Value('string'),
-    'prompt': Value('string'), 
+    'prompt': Value('string'),
     'messages': train_features['messages'],  # Use train's messages structure
     'constraints': train_features['constraints'],  # Use train's constraints structure
     'instruction_id_list_ifeval': test_features['instruction_id_list_ifeval'],  # Use test's structure

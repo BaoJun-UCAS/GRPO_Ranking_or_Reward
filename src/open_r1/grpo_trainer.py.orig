@@ -1312,36 +1312,9 @@ class GRPOTrainer(Trainer):
                             outputs = reward_func(**reward_inputs)
                             rewards_per_func[:, i] = outputs.logits[:, 0]  # Shape (B*G,)
                 else:
-                    if reward_func_name == "qrm_server" and self.accelerator.num_processes > 1:
-                        # The external QRM owns one GPU. Gather each rank's local
-                        # samples so it scores every completion exactly once, then
-                        # broadcast and restore each rank's original slice.
-                        rank_payloads = gather_object([{
-                            "prompts": prompts,
-                            "completions": completions,
-                            "completion_ids": completion_ids_list,
-                        }])
-                        counts = [len(payload["prompts"]) for payload in rank_payloads]
-                        if self.accelerator.is_main_process:
-                            all_prompts = [item for payload in rank_payloads for item in payload["prompts"]]
-                            all_completions = [item for payload in rank_payloads for item in payload["completions"]]
-                            all_completion_ids = [
-                                item for payload in rank_payloads for item in payload["completion_ids"]
-                            ]
-                            output_reward_func = reward_func(
-                                prompts=all_prompts,
-                                completions=all_completions,
-                                completion_ids=all_completion_ids,
-                            )
-                        else:
-                            output_reward_func = [None] * sum(counts)
-                        output_reward_func = broadcast_object_list(output_reward_func, from_process=0)
-                        start = sum(counts[: self.accelerator.process_index])
-                        output_reward_func = output_reward_func[start : start + counts[self.accelerator.process_index]]
-                    else:
-                        output_reward_func = reward_func(
-                            prompts=prompts, completions=completions, completion_ids=completion_ids_list, **reward_kwargs
-                        )
+                    output_reward_func = reward_func(
+                        prompts=prompts, completions=completions, completion_ids=completion_ids_list, **reward_kwargs
+                    )
                     # Convert None values to NaN
                     output_reward_func = [reward if reward is not None else torch.nan for reward in output_reward_func]
 

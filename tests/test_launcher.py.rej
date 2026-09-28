@@ -1,0 +1,16 @@
+--- tests/test_launcher.py
++++ tests/test_launcher.py
+@@ -295,6 +295,13 @@
+     assert qrm["args"][qrm["args"].index("--batch-size") + 1] == "2"
+     server = json.loads((state / "server.json").read_text())
++    assert qrm["args"][qrm["args"].index("--model") + 1] == env.get("QRM_MODEL", "friendshipkim/QRM-Llama3.1-8B-v2")
++    assert qrm["args"][qrm["args"].index("--port") + 1] == env["QRM_HTTP_PORT"]
++    assert qrm["args"][qrm["args"].index("--max-length") + 1] == env["QRM_MAX_LENGTH"]
++    assert qrm["CUDA_VISIBLE_DEVICES"] == "3"
++    assert server["CUDA_VISIBLE_DEVICES"] == "0"
++    assert training["CUDA_VISIBLE_DEVICES"] == "1,2"
++    assert qrm["TMPDIR"] == str(run / "tmp")
+     assert training["args"][training["args"].index("--num_processes") + 1] == "2"
+ 
+ 
+ 

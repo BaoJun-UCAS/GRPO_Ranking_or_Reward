@@ -1,5 +1,4 @@
-# Single-machine recipe: one dedicated vLLM GPU plus N training GPUs.
-# The filename preserves the original five-GPU example; TRAIN_GPUS controls N.
+# Four-GPU split recipe: vLLM + external QRM + two policy-training GPUs.
 # Documented variables are safely resolved by train_scripts/run_helpers.py.
 
 # Model arguments
@@ -50,9 +49,7 @@ per_device_train_batch_size: ${PER_DEVICE_TRAIN_BATCH_SIZE}
 gradient_accumulation_steps: ${GRADIENT_ACCUMULATION_STEPS}
 gradient_checkpointing: true
 gradient_checkpointing_kwargs:
-  # PEFT + DeepSpeed ZeRO-3 needs reentrant recomputation with this pinned stack.
   use_reentrant: true
-reward_batch_size: ${REWARD_BATCH_SIZE}
 
 # Optimizer and schedule
 learning_rate: 1.0e-06
@@ -63,7 +60,9 @@ num_train_epochs: 10
 
 # Reward model
 reward_funcs:
-- qrm
+- qrm_server
+reward_server_url: http://127.0.0.1:${QRM_HTTP_PORT}
+reward_server_timeout: ${QRM_REQUEST_TIMEOUT}
 reward_weights:
 - 1.0
 

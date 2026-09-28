@@ -123,13 +123,13 @@ def resolve(config_path, accelerate_path, env):
         "vllm_server_base_url": f"http://127.0.0.1:{ports[0]}",
         "vllm_group_port": ports[3],
         "reward_server_url": f"http://127.0.0.1:{ports[1]}",
+    if config.get("reward_funcs") != ["qrm_server"]:
+        raise ValueError("This split launcher requires reward_funcs: [qrm_server]")
         "reward_server_timeout": variables["QRM_REQUEST_TIMEOUT"],
     }
     for key, value in expected.items():
         if config.get(key) != value:
             raise ValueError(f"Training template {key} must resolve to {value!r}; got {config.get(key)!r}")
-    if config.get("reward_funcs") != ["qrm_server"]:
-        raise ValueError("This split launcher requires reward_funcs: [qrm_server]")
     if accelerate.get("num_machines", 1) != 1:
         raise ValueError("This launcher supports a single machine; use a separate launcher for multi-node training")
     if accelerate.get("distributed_type") != "DEEPSPEED":

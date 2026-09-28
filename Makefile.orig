@@ -7,7 +7,7 @@ GRPO := $(PYTHON) scripts/grpo.py
 help:
 	@$(GRPO) --help
 	@echo 'Make shortcuts: env-create install doctor doctor-cuda download-models cache smoke train dry-run logs plot-training test'
-	@echo 'Default GPUs: VLLM_GPUS=4, QRM_GPU=5, TRAIN_GPUS=6,7; set DATASET_NAME before launch.'
+	@echo 'Set DATASET_NAME, VLLM_GPU, TRAIN_GPUS, GRPO_OUTPUT_ROOT and HF_HOME as needed; see docs/ENVIRONMENT_SETUP_ZH.md'
 
 doctor:
 	$(GRPO) doctor

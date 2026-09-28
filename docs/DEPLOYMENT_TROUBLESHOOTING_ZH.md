@@ -18,7 +18,7 @@
 | 模型和通信初始化完成，权重更新 HTTP 请求报 502 | 当次环境的 Python requests 确实把 `127.0.0.1` 请求交给 HTTP 代理；服务日志只有已到达请求的 200，没有对应 502，指向代理链路问题 | 为启动器所有子进程统一补充 loopback `NO_PROXY`/`no_proxy`，保留原有外网代理和绕过列表；仅让 health 的 curl 绕过代理不够 |
 | 生成、奖励打分成功，首次反向传播报 `CheckpointError`，权重 shape 变成 `[0]` | PEFT 冻结参数在 ZeRO-3 非重入 checkpoint 重算中被释放；本机 Torch/DeepSpeed 源码与上游报告对应 | 固定版本 recipe 使用 `use_reentrant: true`；正确传递 checkpoint kwargs 并启用输入梯度；启动前拒绝该不兼容组合，不关闭 metadata 检查 |
 | 进程结束后难判断是否有残留 | 旧父进程可能仍活着；`tail -f ...vllm...` 也会被宽泛关键词匹配 | 启动器管理自己创建的进程；排查时核对 UID、PID、父子关系和实际监听端口 |
-| 不知道模型下载到哪里、奖励模型在哪里运行 | 缓存变量和多个终端可能不一致；vLLM 日志不代表奖励模型加载情况 | `download` 与 `cache` 使用同一缓存解析规则；奖励模型由训练端加载 |
+| 不知道模型下载到哪里、奖励模型在哪里运行 | 缓存变量和多个终端可能不一致；vLLM 日志不代表 QRM 服务状态 | `download` 与 `cache` 使用同一缓存解析规则；默认 QRM 在物理 GPU 5 独立加载，并写入 `qrm_server.log` |
 
 ## vLLM 健康检查失败：已知原因与验证边界
 
@@ -72,8 +72,11 @@ python scripts/grpo.py download
 
 ```bash
 python scripts/grpo.py logs --run-dir /path/to/run --service vllm
+python scripts/grpo.py logs --run-dir /path/to/run --service qrm
 curl --noproxy '*' --connect-timeout 1 --max-time 3 -i \
   "http://127.0.0.1:${VLLM_HTTP_PORT:-8000}/health/"
+curl --noproxy "*" --connect-timeout 1 --max-time 3 -i \
+  "http://127.0.0.1:${QRM_HTTP_PORT:-8001}/health/"
 ss -ltnp
 ```
 
@@ -83,7 +86,7 @@ ss -ltnp
 - CUDA/权重加载阶段：检查 traceback、GPU 显存和依赖版本。
 - 编译/图捕获阶段：初次启动可能较慢；有持续进展时才考虑延长 `VLLM_STARTUP_TIMEOUT`。
 - 服务启动前退出：查看 launcher 打印的错误尾部与完整服务日志。
-- 端口已经监听：查明进程归属，或分别配置新的 `VLLM_HTTP_PORT`、训练 `PORT` 和权重同步 `VLLM_GROUP_PORT`，不要自动复用未知服务。三者必须互不相同；权重同步默认端口 51216 也不能被并行实验共享。直接运行服务时，原生 `VLLM_PORT` 属于 vLLM 内部通信，不能与 HTTP 的 `--port` 相同。
+- 端口已经监听：查明进程归属，或分别配置 `VLLM_HTTP_PORT`、`QRM_HTTP_PORT`、训练 `PORT` 和 `VLLM_GROUP_PORT`。四者必须互不相同；不要自动复用未知服务。直接运行 vLLM 服务时，原生 `VLLM_PORT` 属于引擎内部通信，不能与 HTTP 的 `--port` 相同。
 
 “120 秒没写新日志”不等于停止工作：下载、编译或加载时日志可能稀疏。重复重启会中断本来仍在进行的工作，因此不再用该条件自动重启。若持续停滞，保留当次 run、命令、进程树和完整日志，再诊断阻塞位置；不要只增大等待时间。
 
@@ -95,7 +98,7 @@ nvidia-smi topo -m
 nvidia-smi --query-compute-apps=pid,process_name,used_gpu_memory --format=csv
 ```
 
-先确认卡已经分配给当前实验且没有冲突。改变 `VLLM_GPU_MEMORY_UTILIZATION` 不能替代获得空闲卡；QRM 也占训练侧显存。真实 OOM 时依据失败阶段调整奖励 batch、生成长度、batch 或模型配置，再记录解析后的 YAML。
+先确认物理 GPU 4–7 已分配给当前实验且没有冲突。改变 `VLLM_GPU_MEMORY_UTILIZATION` 不能替代获得空闲卡；QRM 独占 GPU 5，不再占用 GPU 6–7 的训练显存。真实 OOM 时按失败角色调整 vLLM 利用率、QRM batch/长度或策略 batch/长度，并记录解析后的 YAML。
 
 `NCCL_P2P_DISABLE=1`、`NCCL_IB_DISABLE=1` 等不应成为所有服务器的默认设置。只有日志、拓扑和最小通信测试指向相关路径时才作有记录的对照实验；盲目关闭可能掩盖配置问题或降低性能。
 
@@ -103,15 +106,15 @@ nvidia-smi --query-compute-apps=pid,process_name,used_gpu_memory --format=csv
 
 当 `CheckpointError` 明确显示冻结权重由正常形状变成 `[0]` 时，检查是否同时启用 PEFT、DeepSpeed ZeRO-3、gradient checkpointing 且 `use_reentrant: false`。本次固定版本组合中，ZeRO-3 的 forward 后置 hook 释放权重，而非重入 checkpoint 仍保留冻结参数对象，导致重算时读取到已清空的参数。机制见 [DeepSpeed #8130](https://github.com/deepspeedai/DeepSpeed/pull/8130)，上游 TRL 的兼容处理见 [TRL #6356](https://github.com/huggingface/trl/pull/6356)。
 
-当前 recipe 明确使用 `gradient_checkpointing_kwargs: {use_reentrant: true}`，trainer 将配置传给底层模型并保证重入式 checkpoint 的输入梯度条件。校验只针对这个固定依赖组合下的 PEFT + ZeRO-3，不强制更改其他训练模式。升级依赖后应重新验证，不能用关闭 metadata 校验、忽略异常或降低学习率来掩盖空权重问题。
+当前四卡默认 recipe 使用 ZeRO-2，因此不会进入上述 ZeRO-3 reference-model 路径；它仍使用 `gradient_checkpointing_kwargs: {use_reentrant: true}`。启动器保留对自定义 ZeRO-3 配置的兼容校验。升级依赖后仍应重新验证，不能用关闭 metadata 校验或忽略异常来掩盖空权重问题。
 
 ## 停止后的进程与端口检查
 
 正常情况下，在启动器所在终端 Ctrl+C，由启动器清理它创建的进程。在只跟随日志的终端 Ctrl+C 不会停止训练。
 
 ```bash
-pgrep -u "$USER" -af 'open_r1[.]vllm_serve|trl vllm-serve|src/open_r1/grpo[.]py|accelerate launch|accelerate[.]commands[.]launch'
-ss -ltnp 'sport = :8000'
+pgrep -u "$USER" -af "open_r1[.](vllm_serve|reward_server)|src/open_r1/grpo[.]py|accelerate launch|accelerate[.]commands[.]launch"
+ss -ltnp "sport = :8000 or sport = :8001"
 nvidia-smi --query-compute-apps=pid,process_name,used_gpu_memory --format=csv
 ```
 
@@ -123,11 +126,12 @@ nvidia-smi --query-compute-apps=pid,process_name,used_gpu_memory --format=csv
 
 ```bash
 export DATASET_NAME=你的组织或用户名/UltraChat-200k
-export VLLM_GPU=0
-export TRAIN_GPUS=1,2,3,4
+export VLLM_GPUS=4
+export QRM_GPU=5
+export TRAIN_GPUS=6,7
 python scripts/grpo.py smoke --dry-run
-# 以下只在上述卡已可用时执行：
-CUDA_VISIBLE_DEVICES="$VLLM_GPU,$TRAIN_GPUS" python scripts/grpo.py doctor --cuda
+# 以下只在物理卡 4–7 已分配且空闲时执行：
+CUDA_VISIBLE_DEVICES=4,5,6,7 python scripts/grpo.py doctor --cuda
 python scripts/grpo.py smoke
 ```
 

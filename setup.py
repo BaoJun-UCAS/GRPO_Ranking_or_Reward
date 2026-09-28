@@ -47,6 +47,7 @@ _deps = [
     "liger-kernel>=0.5.10",
     "lighteval @ git+https://github.com/huggingface/lighteval.git@d3da6b9bbf38104c8b5e1acc86f83541f9a502d1",  # Critical bug fix for tokenizer revisions: https://github.com/huggingface/lighteval/pull/721
     "math-verify==0.5.2",  # Used for math verification in grpo
+    "matplotlib>=3.8,<4",
     "morphcloud==0.1.67",
     "numpy==1.26.4",
     "openai>=1.76.0,<3.0",
@@ -92,6 +93,7 @@ extras["quality"] = deps_list("ruff", "isort", "flake8")
 extras["code"] = deps_list("e2b-code-interpreter", "python-dotenv", "morphcloud", "jieba", "pandas", "aiofiles")
 extras["eval"] = deps_list("lighteval", "math-verify")
 extras["judge"] = deps_list("openai", "anthropic", "numpy", "tqdm")
+extras["plots"] = deps_list("matplotlib")
 extras["dev"] = extras["quality"] + extras["tests"] + extras["eval"] + extras["judge"] + extras["code"]
 
 # core dependencies shared across the whole project - keep this to a bare minimum :)

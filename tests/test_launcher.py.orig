@@ -102,15 +102,6 @@ def test_dry_run_resolves_four_gpu_split(launch_env, tmp_path):
     assert not (tmp_path / "runs").exists()
 
 
-def test_legacy_singular_gpu_variable_is_rejected(launch_env, tmp_path):
-    launch_env.pop("VLLM_GPUS")
-    launch_env["VLLM_GPU"] = "0"
-    result = run_launcher(launch_env, "--dry-run")
-    assert result.returncode != 0
-    assert "VLLM_GPU is no longer supported" in result.stdout
-    assert not (tmp_path / "runs").exists()
-
-
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [

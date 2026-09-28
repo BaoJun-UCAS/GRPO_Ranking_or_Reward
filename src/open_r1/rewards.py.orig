@@ -696,7 +696,6 @@ def get_remote_qrm_reward(server_url: str, timeout: int) -> Callable:
     qrm_server_reward.__name__ = "qrm_server"
     return qrm_server_reward
 
-
 def get_reward_funcs(script_args) -> list[Callable]:
     REWARD_FUNCS_REGISTRY = {
         "accuracy": accuracy_reward,

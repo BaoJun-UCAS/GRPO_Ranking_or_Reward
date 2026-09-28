@@ -34,7 +34,6 @@ def test_required_project_files_exist():
         "docs/ENVIRONMENT_SETUP_ZH.md",
         "docs/GITHUB_PROJECT_MANAGEMENT_ZH.md",
         "recipes/Qwen3-1.7B/config_chat_regular_qrm_lora_5gpu.yaml",
-        "recipes/Qwen3-1.7B/config_chat_regular_qrm_lora_4gpu_split.yaml",
         "train_scripts/qwen3_1.7_grpo_chat.sh",
         "train_scripts/qwen3_1.7_grpo_ranking_chat.sh",
         "src/open_r1/vllm_serve.py",
@@ -97,7 +96,7 @@ def test_manifest_redacts_credentials_but_keeps_token_hyperparameters():
 
 
 def test_four_gpu_split_recipe_and_launcher_contract():
-    recipe = (PROJECT_ROOT / "recipes/Qwen3-1.7B/config_chat_regular_qrm_lora_4gpu_split.yaml").read_text(
+    recipe = (PROJECT_ROOT / "recipes/Qwen3-1.7B/config_chat_regular_qrm_lora_5gpu.yaml").read_text(
         encoding="utf-8"
     )
     launcher = (PROJECT_ROOT / "train_scripts/qwen3_1.7_grpo_chat.sh").read_text(encoding="utf-8")

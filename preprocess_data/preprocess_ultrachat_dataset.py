@@ -39,4 +39,3 @@ print(dataset_dict)
 print("Pushing to hub...")
 dataset_dict.push_to_hub(f"{os.environ['HF_USERNAME']}/UltraChat-200k", token=os.environ["HF_TOKEN"])
 print("UltraChat preprocessing and upload completed.")
-

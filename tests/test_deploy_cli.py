@@ -39,6 +39,15 @@ class DeploymentCliTests(unittest.TestCase):
             self.assertFalse((base / "cache").exists())
             self.assertEqual(cli.paths({"HOME": str(base)})["HF_HOME"], base / ".cache/grpo/huggingface")
 
+    def test_default_cache_prefers_writable_data_root_without_creating_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            data_root = base / "data"
+            data_root.mkdir()
+            selected = cli.paths({"HOME": str(base / "home"), "GRPO_DATA_ROOT": str(data_root)})
+            self.assertEqual(selected["HF_HOME"], data_root / "cache/grpo/huggingface")
+            self.assertFalse((data_root / "cache").exists())
+
     def test_build_caches_use_project_cache_root_and_respect_overrides(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)

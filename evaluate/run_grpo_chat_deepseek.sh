@@ -23,12 +23,23 @@ JUDGE_MODEL="${JUDGE_MODEL:-deepseek-flash}"
 JUDGE_BASE_URL="${JUDGE_BASE_URL:-https://api.deepseek.com}"
 JUDGE_THINKING_MODE="${JUDGE_THINKING_MODE:-disabled}"
 EVAL_SEED="${EVAL_SEED:-42}"
+PYTHON="${PYTHON:-python}"
+MAX_PROMPT_LENGTH="${EVAL_MAX_PROMPT_LENGTH:-2048}"
+BASE_REVISION="${BASE_REVISION:-main}"
+EVAL_DATASET_ID="${EVAL_DATASET_ID:-HuggingFaceH4/ultrachat_200k}"
+EVAL_DATASET_SPLIT="${EVAL_DATASET_SPLIT:-test_sft}"
+EVAL_PROMPT_COLUMN="${EVAL_PROMPT_COLUMN:-messages}"
+EVAL_DATASET_REVISION="${EVAL_DATASET_REVISION:-main}"
+TRAINING_CONFIG="${TRAINING_CONFIG:-${RUN_DIR}/config/resolved_training_config.yaml}"
 
-EVAL_DIR="${RUN_DIR}/evaluation"
+EVAL_DIR="${EVAL_DIR:-${RUN_DIR}/evaluation/$(date -u +%Y%m%dT%H%M%SZ)-$$}"
 COMPLETIONS_DIR="${EVAL_DIR}/completions"
 RESULTS_DIR="${EVAL_DIR}/deepseek_judge"
 LOG_DIR="${EVAL_DIR}/logs"
 mkdir -p "${COMPLETIONS_DIR}" "${RESULTS_DIR}" "${LOG_DIR}"
+# Prevent two launches writing the same explicit evaluation directory.
+exec 9>"${EVAL_DIR}/.evaluation.lock"
+flock -n 9 || { echo "Another evaluation owns ${EVAL_DIR}" >&2; exit 1; }
 
 EVALUATION_STATUS_PATH="${EVAL_DIR}/EVALUATION_STATUS"
 record_exit() {
@@ -50,6 +61,10 @@ if [[ ! -f "${TRAINED_MODEL}/config.json" ]]; then
     echo "Merged model not found at ${TRAINED_MODEL}. Run merge_lora_adapter.py first." >&2
     exit 1
 fi
+if [[ ! -f "${TRAINING_CONFIG}" ]]; then
+    echo "Resolved training config missing: ${TRAINING_CONFIG}; set TRAINING_CONFIG explicitly." >&2
+    exit 1
+fi
 
 BASE_COMPLETIONS="${COMPLETIONS_DIR}/qwen3-1.7b-base-chat_N${NUM_PROMPTS}_seed${EVAL_SEED}_temp${GENERATION_TEMPERATURE}.json"
 TRAINED_COMPLETIONS="${COMPLETIONS_DIR}/qwen3-1.7b-grpo-regular-lora-chat_N${NUM_PROMPTS}_seed${EVAL_SEED}_temp${GENERATION_TEMPERATURE}.json"
@@ -63,6 +78,9 @@ TRAINED_COMPLETIONS="${COMPLETIONS_DIR}/qwen3-1.7b-grpo-regular-lora-chat_N${NUM
     printf 'bootstrap_iterations=%s\n' "${BOOTSTRAP_ITERATIONS}"
     printf 'generation_temperature=%s\n' "${GENERATION_TEMPERATURE}"
     printf 'max_new_tokens=%s\n' "${MAX_NEW_TOKENS}"
+    printf 'max_prompt_length=%s\n' "${MAX_PROMPT_LENGTH}"
+    printf 'dataset_id=%s\ndataset_split=%s\ndataset_revision=%s\n' "${EVAL_DATASET_ID}" "${EVAL_DATASET_SPLIT}" "${EVAL_DATASET_REVISION}"
+    printf 'base_revision=%s\ntraining_config=%s\n' "${BASE_REVISION}" "${TRAINING_CONFIG}"
     printf 'eval_seed=%s\n' "${EVAL_SEED}"
     printf 'judge_model=%s\n' "${JUDGE_MODEL}"
     printf 'judge_base_url=%s\n' "${JUDGE_BASE_URL}"
@@ -74,13 +92,17 @@ generate_if_missing() {
     local model_path=$1
     local output_path=$2
     local log_path=$3
-    if [[ -s "${output_path}" ]]; then
-        echo "Reusing completions: ${output_path}"
-        return
-    fi
-    CUDA_VISIBLE_DEVICES="${EVAL_GPU}" python generate/generate_completions.py \
+    CUDA_VISIBLE_DEVICES="${EVAL_GPU}" "${PYTHON}" generate/generate_completions.py \
         --model "${model_path}" \
+        --revision "${BASE_REVISION}" \
         --dataset chat \
+        --dataset-id "${EVAL_DATASET_ID}" \
+        --dataset-split "${EVAL_DATASET_SPLIT}" \
+        --prompt-column "${EVAL_PROMPT_COLUMN}" \
+        --dataset-revision "${EVAL_DATASET_REVISION}" \
+        --training-config "${TRAINING_CONFIG}" \
+        --max-prompt-length "${MAX_PROMPT_LENGTH}" \
+        --reuse-existing \
         --num-prompts "${NUM_PROMPTS}" \
         --n-completions 1 \
         --temperature "${GENERATION_TEMPERATURE}" \
@@ -94,7 +116,7 @@ generate_if_missing() {
 generate_if_missing "${BASE_MODEL}" "${BASE_COMPLETIONS}" "${LOG_DIR}/generate_base.log"
 generate_if_missing "${TRAINED_MODEL}" "${TRAINED_COMPLETIONS}" "${LOG_DIR}/generate_trained.log"
 
-python evaluate/bootstrap_judge.py \
+"${PYTHON}" evaluate/bootstrap_judge.py \
     --completions1 "${BASE_COMPLETIONS}" \
     --completions2 "${TRAINED_COMPLETIONS}" \
     --api-provider deepseek \

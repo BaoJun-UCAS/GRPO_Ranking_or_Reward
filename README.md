@@ -3,20 +3,22 @@
 GRPO training framework for language-model ranking and reward experiments.
 
 Deployment starts with a CPU-only environment check and a two-step smoke test.
-The default experiment uses Qwen3-1.7B, UltraChat, and a QRM reward model with
-one dedicated vLLM GPU plus configurable ZeRO-3 training GPUs.
+The default launcher uses four physical GPUs: GPU 4 for policy rollout with
+vLLM, GPU 5 for the external 8B QRM server, and GPUs 6–7 for two-process
+DeepSpeed ZeRO-2 LoRA policy training.
 
 The current `studentization` recipe is an experimental baseline, not a verified
 paper-exact reproduction of original GRPO: it uses `loss_type: bnpo` and a custom
 trainer. On 2026-09-24, the 1+4 RTX 4090 smoke test passed readiness, generation,
 weight synchronization, two optimizer steps, checkpoint/adapter saving, and LoRA
 merging. The merged model was reloaded and generated tokens successfully.
-This validates the short smoke configuration, not long-run convergence or the
-memory budget of larger recipes. See:
+That is historical validation of the legacy layout, not validation of the new
+four-GPU split, long-run convergence, or the formal-run memory budget. See:
 
 - [Experiment configuration and change log](EXPERIMENT_GRPO_5GPU.md)
 - [Chinese environment setup guide](docs/ENVIRONMENT_SETUP_ZH.md)
 - [Deployment failures, evidence, and troubleshooting](docs/DEPLOYMENT_TROUBLESHOOTING_ZH.md)
+- [Validation, evaluation contracts, caching, and offline plots](docs/EVALUATION_ZH.md)
 - [Chinese GitHub project management guide](docs/GITHUB_PROJECT_MANAGEMENT_ZH.md)
 
 ## Installation
@@ -75,9 +77,10 @@ All shortcuts use the active Python environment and work without `make` via
 | Download policy and reward models | `make download-models` | None; uses network and disk |
 | Inspect model cache and partial files | `make cache` | None |
 | Preview smoke plan and resolved configuration | `make dry-run` | None; no run directory created |
-| Run two optimizer steps | `make smoke` | Starts vLLM and training |
-| Run the configured experiment | `make train` | Starts vLLM and training |
-| Follow latest vLLM log | `make logs` | None |
+| Run two optimizer steps | `make smoke` | Starts QRM, vLLM, and training |
+| Run the configured experiment | `make train` | Starts QRM, vLLM, and training |
+| Follow the latest service/training log | `make logs` | None |
+| Plot training metrics | `make plot-training RUN_DIR=/path/to/run` | None |
 | Run lightweight tests | `make test` | None |
 
 For the CPU test suite alone, install `requirements-test.txt`; the full training
@@ -87,18 +90,19 @@ Set the dataset and GPU assignment before the launch commands:
 
 ```bash
 export DATASET_NAME=your_org/UltraChat-200k
-export VLLM_GPU=0
-export TRAIN_GPUS=1,2,3,4
+export VLLM_GPUS=4
+export QRM_GPU=5
+export TRAIN_GPUS=6,7
 python scripts/grpo.py smoke --dry-run
 python scripts/grpo.py download
 # Run only after the selected GPUs are available:
 python scripts/grpo.py smoke
 ```
 
-GPU numbers are examples, not a reservation or a topology recommendation for
-every server. Use `nvidia-smi topo -m` and local scheduling rules to select them.
-For the previously inspected eight-4090 host, training GPUs `4,5,6,7` shared
-NUMA 1; this fact does not apply automatically to another host.
+These defaults target the inspected eight-GPU host. The launcher sets
+`CUDA_DEVICE_ORDER=PCI_BUS_ID` and isolates each role itself; do not wrap it in
+another `CUDA_VISIBLE_DEVICES`. Alternate physical GPU IDs remain configurable,
+but must be explicit, disjoint, and checked against local scheduling rules.
 
 ## Data Preprocessing
 
@@ -136,11 +140,11 @@ Merges `allenai/tulu-3-sft-personas-instruction-following` (train) with `google/
 
 ## Training
 
-The Chat launcher starts `python -m open_r1.vllm_serve`, waits for a bounded
-readiness check, then starts ZeRO-3 training. The local service preserves the
-TRL 0.18 client protocol and avoids that version's extra outer model process.
-Do not replace it with `trl vllm-serve` or a generic OpenAI-compatible vLLM
-server: the trainer also requires weight-synchronization endpoints.
+The Chat launcher first starts `python -m open_r1.reward_server` on GPU 5,
+then `python -m open_r1.vllm_serve` on GPU 4, and verifies an instance-specific
+health endpoint for each service before starting two-process ZeRO-2 training on
+GPUs 6–7. The vLLM service preserves the TRL 0.18 weight-synchronization
+protocol; a generic OpenAI-compatible endpoint is not sufficient.
 
 ### Running Training
 
@@ -157,18 +161,22 @@ bash train_scripts/qwen3_1.7_grpo_ranking_chat.sh
 
 | Variable | Purpose |
 | --- | --- |
-| `VLLM_GPU`, `TRAIN_GPUS` | One server GPU and a disjoint, nonempty list of training GPUs; process count is inferred |
+| `VLLM_GPUS`, `QRM_GPU`, `TRAIN_GPUS` | Disjoint rollout, reward-server, and policy-training GPUs; defaults are `4`, `5`, and `6,7` |
 | `DATASET_NAME` | Dataset ID; alternatively set `HF_USERNAME` for its `UltraChat-200k` dataset |
-| `MODEL_NAME`, `CONFIG_FILE`, `ACCELERATE_CONFIG` | Model and recipe selection; changing the model can also require LoRA/reward adjustments |
+| `MODEL_NAME`, `QRM_MODEL`, `QRM_REVISION` | Policy/reward model selection; pin revisions for formal runs |
+| `CONFIG_FILE`, `ACCELERATE_CONFIG` | Defaults to the four-GPU external-QRM recipe and two-process ZeRO-2 |
 | `GRPO_OUTPUT_ROOT`, `RUN_DIR` | Output root, or an explicit new run directory; existing directories are not overwritten |
 | `RESUME_FROM_CHECKPOINT` | Explicit checkpoint path for resuming into a new run directory |
-| `GRPO_CACHE_ROOT`, `HF_HOME`, `HF_HUB_CACHE` | Cache location; explicit Hugging Face settings take precedence |
+| `GRPO_CACHE_ROOT`, `GRPO_DATA_ROOT`, `HF_HOME`, `HF_HUB_CACHE` | Cache location; explicit paths win, otherwise a writable `/data/<user>/cache/grpo` is preferred before the home-directory fallback |
+| `VLLM_TMPDIR` | Optional short vLLM IPC directory; the launcher otherwise creates and cleans `/tmp/grpo-vllm.*` |
 | `NUM_GENERATIONS`, `PER_DEVICE_TRAIN_BATCH_SIZE`, `GRADIENT_ACCUMULATION_STEPS` | Batch configuration; generation batch is derived unless explicitly supplied |
-| `MAX_STEPS`, `MAX_PROMPT_LENGTH`, `MAX_COMPLETION_LENGTH`, `REWARD_BATCH_SIZE` | Training scale and memory controls |
-| `VLLM_HTTP_PORT`, `PORT`, `VLLM_GROUP_PORT` | HTTP, training rendezvous, and weight-sync ports (defaults: 8000, 29501, 51216); use three distinct ports per experiment |
+| `MAX_STEPS`, `MAX_PROMPT_LENGTH`, `MAX_COMPLETION_LENGTH`, `REWARD_BATCH_SIZE` | Training scale and memory controls; QRM defaults to batch 1 |
+| `QRM_MAX_LENGTH`, `QRM_REQUEST_TIMEOUT`, `QRM_STARTUP_TIMEOUT` | Reward-server context and bounded request/startup waits |
+| `VLLM_HTTP_PORT`, `QRM_HTTP_PORT`, `PORT`, `VLLM_GROUP_PORT` | vLLM HTTP, QRM HTTP, training rendezvous, and weight-sync ports; all four must be distinct |
 
 The default output root is `grpo_runs/` inside the repository. Without explicit
-cache settings, models use `${XDG_CACHE_HOME:-$HOME/.cache}/grpo/huggingface`.
+cache settings, models prefer `/data/<user>/cache/grpo/huggingface` when that
+data root is writable, then fall back to `$HOME/.cache/grpo/huggingface`.
 The launcher stores the resolved YAML, hardware snapshot, terminal logs, reward
 records, checkpoints, final adapter, and merged evaluation model in one run
 directory. W&B defaults to offline mode; set `WANDB_MODE=online` to upload
@@ -187,6 +195,7 @@ Follow the log for a specific run:
 
 ```bash
 python scripts/grpo.py logs --run-dir /path/to/run --service vllm --follow
+python scripts/grpo.py logs --run-dir /path/to/run --service qrm --follow
 python scripts/grpo.py logs --run-dir /path/to/run --service training --follow
 ```
 
@@ -196,7 +205,8 @@ Recipes are in `recipes/Qwen3-1.7B/`:
 
 | Config | Dataset | Advantage | Reward Model |
 |--------|---------|-----------|--------------|
-| `config_chat_regular_qrm_lora_5gpu.yaml` | UltraChat | Studentization | QRM (LoRA + server vLLM) |
+| `config_chat_regular_qrm_lora_4gpu_split.yaml` | UltraChat | Studentization | External QRM; 1 vLLM + 2 ZeRO-2 training GPUs |
+| `config_chat_regular_qrm_lora_5gpu.yaml` | UltraChat | Studentization | Legacy local QRM training recipe |
 | `config_chat_regular_qrm_seed42.yaml` | UltraChat | Regular | QRM |
 | `config_chat_ranking_qrm_seed42.yaml` | UltraChat | Ranking | QRM |
 | `config_tldr_regular_skywork-8b_seed42.yaml` | TLDR | Regular | Skywork-8B |

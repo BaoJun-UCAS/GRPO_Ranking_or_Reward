@@ -133,7 +133,7 @@ class UpdateWeightsRequest(BaseModel):
     shape: list[Annotated[int, Field(ge=0)]]
 
 
-def create_app(llm: "LLM", tensor_parallel_size: int, shutdown_timeout: float = 10.0, run_id: str | None = None) -> FastAPI:
+def create_app(llm: "LLM", tensor_parallel_size: int, shutdown_timeout: float = 10.0) -> FastAPI:
     """Build the TRL 0.18 API (one training client, one engine, TP supported).
 
     An acknowledged NCCL request is queued, not yet complete. Its later failure
@@ -181,12 +181,6 @@ def create_app(llm: "LLM", tensor_parallel_size: int, shutdown_timeout: float = 
 
     @app.get("/health/")
     async def health():
-        return {"status": "ok"}
-
-    @app.get("/health/{requested_run_id}/")
-    async def owned_health(requested_run_id: str):
-        if run_id is None or requested_run_id != run_id:
-            raise HTTPException(status_code=404, detail="Unknown run")
         return {"status": "ok"}
 
     @app.get("/get_world_size/")
@@ -293,7 +287,6 @@ def parse_args(argv=None) -> argparse.Namespace:
         parser.error("--gpu_memory_utilization must be greater than 0 and at most 1")
     if args.max_model_len is not None and args.max_model_len < 1:
         parser.error("--max_model_len must be positive")
-    parser.add_argument("--run-id")
     if not 0 < args.shutdown_timeout < float("inf"):
         parser.error("--shutdown_timeout must be finite and positive")
     return args
@@ -328,7 +321,7 @@ def main() -> None:
         enforce_eager=args.enforce_eager,
         worker_extension_cls=WORKER_EXTENSION,
     )
-    app = create_app(llm, args.tensor_parallel_size, args.shutdown_timeout, run_id=args.run_id)
+    app = create_app(llm, args.tensor_parallel_size, args.shutdown_timeout)
     uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)
 
 

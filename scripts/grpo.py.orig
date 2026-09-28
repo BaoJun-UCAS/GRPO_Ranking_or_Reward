@@ -100,7 +100,7 @@ def doctor(args):
         report(os.access(parent, os.W_OK | os.X_OK), key, f"{path}; free {gib(shutil.disk_usage(parent).free)}")
     if os.environ.get("TMPDIR"):
         report(selected["TMPDIR"].is_dir(), "TMPDIR exists", str(selected["TMPDIR"]))
-    for key in ("VLLM_GPUS", "QRM_GPU", "TRAIN_GPUS", "DATASET_NAME"):
+    for key in ("VLLM_GPUS", "VLLM_GPU", "QRM_GPU", "TRAIN_GPUS", "DATASET_NAME"):
         print(f"{key}: {os.environ.get(key, '(not set)')}")
     if not os.environ.get("DATASET_NAME") and not os.environ.get("HF_USERNAME"):
         print("NOTE set DATASET_NAME or HF_USERNAME before smoke/train/dry-run.")

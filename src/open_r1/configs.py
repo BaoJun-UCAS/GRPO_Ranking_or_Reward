@@ -257,8 +257,16 @@ class GRPOScriptArguments(ScriptArguments):
     reward_funcs: list[str] = field(
         default_factory=lambda: ["accuracy", "format", "tag_count", "qrm"],
         metadata={
-            "help": "List of reward functions. Possible values: 'accuracy', 'format', 'reasoning_steps', 'cosine', 'repetition_penalty', 'length', 'tag_count', 'code', 'code_format', 'qrm'"
+            "help": "Reward functions, including 'qrm' (local model) and 'qrm_server' (external HTTP service)."
         },
+    )
+    reward_server_url: Optional[str] = field(
+        default=None,
+        metadata={"help": "Base URL of the external neural reward-model service."},
+    )
+    reward_server_timeout: int = field(
+        default=900,
+        metadata={"help": "Timeout in seconds for one external reward-model request."},
     )
     cosine_min_value_wrong: float = field(
         default=0.0,

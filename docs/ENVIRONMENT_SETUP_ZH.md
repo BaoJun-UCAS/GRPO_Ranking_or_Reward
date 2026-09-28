@@ -1,8 +1,8 @@
 # GRPO 部署与运行指南
 
-本文使用项目根目录下的 `environment.yml` 作为统一安装入口，面向 Linux、Python 3.11、NVIDIA CUDA GPU。默认研究配置为 Qwen3-1.7B + UltraChat + QRM、LoRA 策略训练，采用 1 张独立生成卡和 N 张 ZeRO-3 训练卡。示例为 1+4 卡；支持改变进程数不代表任意数量/型号的 GPU 都能容纳该配置。
+本文使用项目根目录下的 `environment.yml` 作为统一安装入口，面向 Linux、Python 3.11、NVIDIA CUDA GPU。当前四卡默认布局为：物理 GPU 4 运行策略 rollout（vLLM），GPU 5 运行独立 8B QRM 服务，GPU 6–7 运行两进程 DeepSpeed ZeRO-2 LoRA 策略训练；启动器不会使用 GPU 0–3。
 
-当前状态：2026-09-24 已在 1+4 张 RTX 4090 上完成 health、生成、权重同步、两步训练、checkpoint/adapter 保存和 LoRA 合并，并重新加载合并模型完成生成。该结果仅覆盖短 smoke 配置；更长序列、更大 batch 和正式实验仍需显存与算法验证。`studentization` 是当前实验 baseline 的优势选项；配置还使用 `bnpo` 和自定义 trainer，不能直接宣称是论文原始 GRPO 的严格复现。详细记录见 [实验说明](../EXPERIMENT_GRPO_5GPU.md) 和 [部署问题复盘](DEPLOYMENT_TROUBLESHOOTING_ZH.md)。
+当前状态：2026-09-24 的 1+4 卡验收属于旧布局的历史证据；新的 1+1+2 四卡拆分已完成静态与 CPU 模拟测试，仍应先运行两步真实 GPU smoke，再开始正式训练。`studentization`、`bnpo` 和自定义 trainer 仍是实验 baseline，不能直接宣称为论文原始 GRPO 的严格复现。历史记录见 [旧五卡实验说明](../EXPERIMENT_GRPO_5GPU.md)，当前排查方法见 [部署问题复盘](DEPLOYMENT_TROUBLESHOOTING_ZH.md)。
 
 ## 1. 检查账户与系统
 
@@ -50,7 +50,9 @@ df -i "$TMPDIR" "$GRPO_WORK_DIR"
 
 建议初次实验预留约 100–200 GB 作为容量规划起点，实际需要受环境、模型版本、checkpoint 数量和训练步数影响；这不是精确下载量。BF16 参数量估算下，1.7B 策略模型与 8B 奖励模型的权重合计约 19.4 GB（十进制），实际仓库下载还可能包含额外文件。可以先下载再运行训练，避免把下载时间误认成初始化挂起。
 
-模型 Hub 缓存优先级为 `HF_HUB_CACHE`、兼容旧设置的 `HUGGINGFACE_HUB_CACHE`、`HF_HOME/hub`。项目默认 `HF_HOME` 为 `${GRPO_CACHE_ROOT}/huggingface`，默认 `GRPO_CACHE_ROOT` 为 `${XDG_CACHE_HOME:-$HOME/.cache}/grpo`。在不同终端运行下载和训练时，应使用同一组路径，否则可能重复下载。项目不会自动加载 `.env`；这些变量可放入自己保管的 shell 配置片段，再显式 `source`。
+模型 Hub 缓存优先级为 `HF_HUB_CACHE`、兼容旧设置的 `HUGGINGFACE_HUB_CACHE`、`HF_HOME/hub`。项目默认 `HF_HOME` 为 `${GRPO_CACHE_ROOT}/huggingface`。缓存根目录依次选择显式 `GRPO_CACHE_ROOT`、显式 `XDG_CACHE_HOME/grpo`、可写的 `/data/<用户>/cache/grpo`，最后回退到 `$HOME/.cache/grpo`；可用 `GRPO_DATA_ROOT` 改写自动探测的数据盘根目录。在不同终端运行下载和训练时，应使用同一组路径，否则可能重复下载。项目不会自动加载 `.env`；这些变量可放入自己保管的 shell 配置片段，再显式 `source`。
+
+vLLM TP>1 会创建 Unix IPC socket。启动器默认给 vLLM 单独创建长度受控的 `/tmp/grpo-vllm.*`，退出时只删除自己创建的目录；训练过程的 `TMPDIR` 仍保存在 run 目录。若显式设置 `VLLM_TMPDIR`，路径长度不得超过 60 个字符，且启动器不会删除用户提供的目录。
 
 训练启动器还将 Torch 扩展、Triton 和 vLLM 的缓存默认放到 `GRPO_CACHE_ROOT` 下的 `torch_extensions`、`triton`、`vllm` 子目录，避免模型在大盘、编译缓存却写满系统盘。显式设置 `TORCH_EXTENSIONS_DIR`、`TRITON_CACHE_DIR`、`VLLM_CACHE_ROOT` 时保留你的选择；`doctor` 会显示这些路径。首次安装 FlashAttention 的构建缓存与 pip 临时目录仍按安装时的环境变量管理。
 
@@ -102,7 +104,7 @@ python scripts/grpo.py doctor
 `doctor` 不初始化 CUDA，也不启动服务或训练；GPU 被其他用户占用时可运行。`pip check` 只检查已经安装的软件包的依赖声明，缺少整个项目或 CUDA 编译组件时也可能通过。CUDA 可见性和编译扩展导入检查留到目标卡可用后：
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3,4 python scripts/grpo.py doctor --cuda
+CUDA_VISIBLE_DEVICES=4,5,6,7 python scripts/grpo.py doctor --cuda
 ```
 
 这里的卡号仅是例子，应换为分配给自己的 GPU。`doctor --cuda` 不执行真实训练或生成 kernel，不能代替 smoke。仅运行无 GPU 测试时，可安装 `python -m pip install -r requirements-test.txt`，再执行 `make test`，无需安装整套训练依赖。
@@ -128,7 +130,7 @@ watch -n 5 'python scripts/grpo.py cache'
 
 缓存体积和 `.incomplete` 文件能提示是否有下载活动，但不等于精确百分比；使用 Xet 等下载方式时，中间缓存可能位于其他子目录。显式下载命令的进度和成功退出才是更可靠的信号。缓存下载完成也不代表模型已经加载到 GPU。
 
-QRM 奖励模型由训练端载入并参与打分；独立 vLLM GPU 加载的是策略模型。默认配置不会再额外要求一张专用奖励卡，奖励模型仍计入训练侧的显存预算。
+QRM 奖励模型由 `open_r1.reward_server` 在物理 GPU 5 单独加载；策略训练进程不会再复制 8B QRM。训练 rank 会把待评分样本聚合到主 rank，由主 rank 发出一次 HTTP 请求，再广播并切分奖励结果。
 
 ## 6. 准备数据集
 
@@ -153,11 +155,12 @@ export DATASET_NAME="$HF_USERNAME/UltraChat-200k"
 
 ## 7. 预览、两步训练、正式运行
 
-选择卡时先看 `nvidia-smi` 和 `nvidia-smi topo -m`。优先选择空闲且同一 NUMA 节点的训练组；旧服务器的 `4,5,6,7` 为 `NODE` 连接，不是 `PIX` 或 NVLink。不要把旧机器卡号套用到新机器。vLLM 卡与训练卡必须互不重叠。
+当前启动器默认使用物理卡 4–7，并设置 `CUDA_DEVICE_ORDER=PCI_BUS_ID`：GPU 4 为 vLLM、GPU 5 为 QRM、GPU 6–7 为策略训练。三个角色必须互不重叠；启动前仍要用 `nvidia-smi` 和 `nvidia-smi topo -m` 确认这些卡已分配且空闲。
 
 ```bash
-export VLLM_GPU=0
-export TRAIN_GPUS=1,2,3,4
+export VLLM_GPUS=4
+export QRM_GPU=5
+export TRAIN_GPUS=6,7
 python scripts/grpo.py smoke --dry-run
 ```
 
@@ -171,35 +174,37 @@ python scripts/grpo.py train
 
 对应快捷命令是 `make dry-run`、`make smoke`、`make train`。也可直接使用 `bash train_scripts/qwen3_1.7_grpo_chat.sh --dry-run` 或去掉 `--dry-run` 执行训练。不要在总启动器外包一层 `CUDA_VISIBLE_DEVICES` 重新编号；启动器会分别为服务和训练设置可见 GPU。
 
-一次实验需要三个不同的本机端口：`VLLM_HTTP_PORT` 用于 HTTP（默认 8000），`PORT` 用于训练进程集合（默认 29501），`VLLM_GROUP_PORT` 用于训练端与 vLLM 的权重同步（默认 51216）。并行实验除分配不同 GPU、run 目录外，还需为每次实验分别选择未占用的端口。例如：
+一次实验需要四个不同的本机端口：`VLLM_HTTP_PORT`（默认 8000）、`QRM_HTTP_PORT`（默认 8001）、训练 rendezvous 的 `PORT`（默认 29501），以及权重同步的 `VLLM_GROUP_PORT`（默认 51216）。并行实验还需使用不同 GPU、run 目录和全部四个端口。例如：
 
 ```bash
-VLLM_HTTP_PORT=8010 PORT=29511 VLLM_GROUP_PORT=51226 python scripts/grpo.py train
+VLLM_HTTP_PORT=8010 QRM_HTTP_PORT=8011 PORT=29511 \
+VLLM_GROUP_PORT=51226 python scripts/grpo.py train
 ```
 
 启动器在启动前检查端口，但检查不是预留；若随后发生端口竞争，仍需依据当次日志处理。
 
 不要将 vLLM 原生的 `VLLM_PORT` 当作 HTTP 端口：它实际用于引擎内部通信。启动器兼容旧变量作为 HTTP 端口的弃用别名，但不会继续向模型进程传递它。直接调用服务模块时使用 `--port` 配置 HTTP；不要同时把 `VLLM_PORT` 设成相同值。
 
-训练进程数由 `TRAIN_GPUS` 数量推导。默认每卡 batch 为 1，正式梯度累积为 64；generation batch 自动取：
+训练进程数由 `TRAIN_GPUS` 数量推导，vLLM tensor-parallel 大小由 `VLLM_GPUS` 数量推导。当前默认是 `VLLM_GPUS=4`、`QRM_GPU=5`、`TRAIN_GPUS=6,7`、每卡 batch 1、梯度累积 128，有效 generation batch 为 256。旧的单数变量 `VLLM_GPU` 会被明确拒绝，避免遗留的 `VLLM_GPU=0` 覆盖新布局。generation batch 自动取：
 
 ```text
 训练卡数 × PER_DEVICE_TRAIN_BATCH_SIZE × GRADIENT_ACCUMULATION_STEPS
 ```
 
-如果显式设置 `GENERATION_BATCH_SIZE`，它必须满足上述约束且能被 `NUM_GENERATIONS` 整除。smoke 默认两步、梯度累积 8、训练侧 prompt 截断 512、completion 上限 256、奖励 batch 2，默认跳过合并；它验证流水线，不用于报告收敛结果。当前 vLLM 和奖励模型仍接收完整 prompt，并不受训练侧的 prompt 截断限制，长输入语义需按 [实验说明](../EXPERIMENT_GRPO_5GPU.md#默认参数) 单独审核。快捷命令尊重已显式设置的环境变量，运行前注意清除之前的 `MAX_STEPS` 等覆盖。GPU 数量改变还会改变有效 batch 和显存/通信开销，跨实验比较需记录这些变化。
+如果显式设置 `GENERATION_BATCH_SIZE`，它必须满足上述约束且能被 `NUM_GENERATIONS` 整除。smoke 默认两步、梯度累积 8、prompt 上限 512、completion 上限 256、QRM batch 1，并跳过合并；它验证流水线，不用于报告收敛结果。数据映射阶段会在保留聊天结构的前提下左截断最后一条用户内容，因此策略训练、vLLM rollout 和 QRM 共享同一结构化 prompt。快捷命令尊重显式环境变量，运行前注意清除旧覆盖。
 
 两步验收需要同时满足：服务 health 成功；生成和训练侧权重同步无错误；完成两个 optimizer step；adapter 保存成功；`RUN_STATUS` 为 success。要连同合并验收，执行 `MERGE_AFTER_TRAINING=1 python scripts/grpo.py smoke` 并确认合并产物可加载。正式 `train` 默认开启合并。只看到权重下载或 `/health/` 返回 200 都不等于训练成功。
 
-当前固定依赖的 PEFT + ZeRO-3 配置使用重入式梯度 checkpoint（`gradient_checkpointing_kwargs.use_reentrant: true`）。非重入模式已在首次 backward 中实测触发空权重形状错误，启动器会在预览时拒绝该组合；不要为套用其他项目的示例而直接改成 `false`，详见故障复盘。
+当前四卡 recipe 使用两进程 ZeRO-2；LoRA 下可通过禁用 adapter 复用基础策略作为 reference，避免 ZeRO-3 路径额外复制 reference model。recipe 仍保留重入式 gradient checkpoint。旧 ZeRO-3 配置的非重入 checkpoint 故障属于历史兼容边界，详见故障复盘。
 
 ## 8. 查看日志、停止与恢复
 
 ```bash
 python scripts/grpo.py logs --service vllm --follow
+python scripts/grpo.py logs --service qrm --follow
 python scripts/grpo.py logs --service training --follow
 # 多人或多次运行时明确指定目录，避免查看错日志：
-python scripts/grpo.py logs --run-dir /path/to/run --service vllm --follow
+python scripts/grpo.py logs --run-dir /path/to/run --service qrm --follow
 ```
 
 默认输出根目录是仓库内的 `grpo_runs/`，可用 `GRPO_OUTPUT_ROOT` 改到大磁盘。一次运行的配置、版本、硬件快照、训练/服务日志、状态和模型都集中在该 run 目录。健康检查的作用是防止训练在生成服务尚未就绪时启动；超时只是“未就绪”的结果，原因仍需查看 `vllm_server.log` 中的首次异常。
@@ -217,6 +222,8 @@ python scripts/grpo.py train
 启动器拒绝覆盖已有 run 目录，原始失败日志和 checkpoint 会保留。`RUN_DIR` 可指定新输出位置；它不负责覆盖或复用旧目录。恢复需要完整 checkpoint，而非仅最终 adapter；smoke 若保存了完整 `checkpoint-2` 也可恢复，继续训练时目标总步数应大于已完成步数。没有 checkpoint 的启动失败目录不能恢复训练；固定 `RUN_NAME` 也不能替代检查 checkpoint。首次正式运行建议使用默认的时间戳名称。
 
 ## 9. 扩展与评测
+
+验证配置、独立评测目录、缓存有效性、失败状态和无 GPU 绘图见 [验证与评测指南](EVALUATION_ZH.md)。修复后的评测不再直接复用旧格式生成文件，旧判决缓存也会因协议版本更新失效；保留历史证据并新建评测目录。
 
 更换服务器主要改 GPU 分配和缓存/结果路径；更换模型、数据集或奖励方法则需要相应 recipe 与代码适配。部署变量通过环境传入，实验超参数以解析后的 YAML 为准，奖励函数扩展放在 `src/open_r1/rewards.py` 对应注册逻辑，避免继续在启动脚本堆叠机器专用分支。
 

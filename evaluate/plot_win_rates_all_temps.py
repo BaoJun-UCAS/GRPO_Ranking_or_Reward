@@ -137,7 +137,7 @@ def load_temperature_folder_data(folder_path: str, N: Optional[int] = None, B: O
                 json_files = [f for f in json_files if 'skywork' in f.lower()]
             elif chat_evaluator.lower() == 'qrm':
                 # Match 'qrm' explicitly OR files without 'skywork' (default is qrm)
-                json_files = [f for f in json_files if 'qrm' in f.lower() or 'skywork' not in f.lower()]
+                json_files = [f for f in json_files if 'qrm' in f.lower()]
             else:
                 raise ValueError(f"Invalid chat_evaluator '{chat_evaluator}'. Must be 'skywork' or 'qrm'")
 
@@ -164,6 +164,8 @@ def load_temperature_folder_data(folder_path: str, N: Optional[int] = None, B: O
             if win_rate_data is not None:
                 if checkpoint not in data_by_checkpoint_and_index:
                     data_by_checkpoint_and_index[checkpoint] = {}
+                if comp_index in data_by_checkpoint_and_index[checkpoint]:
+                    raise ValueError(f"Ambiguous duplicate checkpoint/index: {checkpoint}/{comp_index}")
                 data_by_checkpoint_and_index[checkpoint][comp_index] = win_rate_data
                 if model1_name is None:
                     model1_name = win_rate_data.get('model1_name', 'model1')
@@ -221,6 +223,8 @@ def load_temperature_folder_data(folder_path: str, N: Optional[int] = None, B: O
             win_rate_data = load_win_rate_data(json_path)
 
             if win_rate_data is not None:
+                if checkpoint in data_by_checkpoint:
+                    raise ValueError(f"Ambiguous duplicate checkpoint: {checkpoint}; use separate result directories")
                 data_by_checkpoint[checkpoint] = win_rate_data
                 if model1_name is None:
                     model1_name = win_rate_data.get('model1_name', 'model1')
@@ -413,7 +417,7 @@ def plot_all_temperatures(data_by_temp: Dict[float, Tuple[Dict[int, Dict[str, An
             ax.axhline(y=0.5, color='black', linestyle=pc.REFLINE_STYLE, linewidth=pc.REFLINE_WIDTH, alpha=pc.REFLINE_ALPHA, zorder=1)
 
             # Set y-axis limits
-            ax.set_ylim([0.45, 0.65])
+            ax.set_ylim([0, 1])
 
             plt.subplots_adjust(left=pc.SUBPLOT_LEFT, right=pc.SUBPLOT_RIGHT,
                                 top=pc.SUBPLOT_TOP, bottom=pc.SUBPLOT_BOTTOM)
@@ -592,7 +596,7 @@ def plot_multi_model_temperatures(all_model_data: Dict[str, Dict[float, Tuple[Di
         ax.axhline(y=0.5, color='black', linestyle=pc.REFLINE_STYLE, linewidth=pc.REFLINE_WIDTH, alpha=pc.REFLINE_ALPHA, zorder=1)
 
         # Set y-axis limits
-        ax.set_ylim([0.4, 0.8])
+        ax.set_ylim([0, 1])
 
         plt.subplots_adjust(left=pc.SUBPLOT_LEFT, right=pc.SUBPLOT_RIGHT,
                             top=pc.SUBPLOT_TOP, bottom=pc.SUBPLOT_BOTTOM)

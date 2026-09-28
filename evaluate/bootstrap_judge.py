@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Bootstrap-based LLM-as-judge evaluation with CLT confidence intervals.
+Bootstrap-based LLM-as-judge evaluation with percentile confidence intervals.
 
 This script sends N unique response pairs to the judge once, then constructs confidence
 intervals by resampling those N judgments locally with replacement. This keeps the API
@@ -19,6 +19,9 @@ import random
 import time
 from typing import List, Dict, Any, Optional, Tuple
 from tqdm import tqdm
+
+JUDGE_PROTOCOL_VERSION = "survey-v2-strict-sections"
+JUDGE_PARSER_VERSION = "2"
 
 # NumPy for statistical calculations
 try:
@@ -43,14 +46,16 @@ except ImportError:
 
 def read_single_completions_artifact(path: str, completion_index: int = 0) -> Tuple[Dict[str, Any], List[Dict[str, str]]]:
     """Read a single model's completions artifact (prompt + completions/responses pairs).
-    
+
     Args:
         path: Path to the completions file (JSON or JSONL)
         completion_index: Which completion to extract from multi-completion files (default: 0 = first)
-    
+
     Returns:
         Tuple of (metadata dict, items list with 'completion' key)
     """
+    if completion_index < 0:
+        raise ValueError("completion_index must be nonnegative")
     # Handle both JSON and JSONL formats
     with open(path, "r", encoding="utf-8") as f:
         if path.endswith(".jsonl"):
@@ -63,55 +68,71 @@ def read_single_completions_artifact(path: str, completion_index: int = 0) -> Tu
             data = json.load(f)
             meta = data.get("meta", {})
             items = data.get("items", [])
-    
+
+    if meta.get("artifact_version") is not None:
+        actual_hash = hashlib.sha256(json.dumps(items, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+        if meta.get("items_sha256") != actual_hash:
+            raise ValueError(f"Completions artifact integrity check failed: {path}")
+
     # Process each item to extract the requested completion
     for idx, it in enumerate(items):
         if not isinstance(it.get("prompt"), str):
             raise ValueError(f"Item {idx} missing or invalid 'prompt' field")
-        
+
         # Handle multiple possible formats
         completion_extracted = False
-        
+
         # Format 1: "responses" key (from n30 JSONL files)
         if "responses" in it and isinstance(it["responses"], list):
             if len(it["responses"]) <= completion_index:
                 raise IndexError(f"Item {idx}: Requested completion_index={completion_index} but only {len(it['responses'])} responses available")
             it["completion"] = it["responses"][completion_index]
             completion_extracted = True
-        
+
         # Format 2: "completions" key (from generate_completions.py)
         elif "completions" in it and isinstance(it["completions"], list):
             if len(it["completions"]) <= completion_index:
                 raise IndexError(f"Item {idx}: Requested completion_index={completion_index} but only {len(it['completions'])} completions available")
             it["completion"] = it["completions"][completion_index]
             completion_extracted = True
-        
+
         # Format 3: "completion" key (legacy single completion)
         elif "completion" in it and isinstance(it["completion"], str):
             if completion_index != 0:
                 raise ValueError(f"Item {idx}: Requested completion_index={completion_index} but file only has single completion")
             # Already in correct format
             completion_extracted = True
-        
+
         if not completion_extracted:
             raise ValueError(f"Item {idx} missing completion data (expected 'completion', 'completions', or 'responses' key)")
-    
+        if not isinstance(it["completion"], str):
+            raise ValueError(f"Item {idx}: completion must be text")
+
     return meta, items
 
 
-def merge_completions_artifacts(meta1: Dict[str, Any], items1: List[Dict[str, str]], 
+def merge_completions_artifacts(meta1: Dict[str, Any], items1: List[Dict[str, str]],
                                meta2: Dict[str, Any], items2: List[Dict[str, str]]) -> Tuple[Dict[str, Any], List[Dict[str, str]]]:
     """Merge two single completions artifacts into paired format, validating prompts match."""
     if len(items1) != len(items2):
         raise ValueError(f"Mismatch in number of items: {len(items1)} vs {len(items2)}")
-    
+    contract1, contract2 = meta1.get("contract"), meta2.get("contract")
+    if bool(contract1) != bool(contract2):
+        raise ValueError("Cannot compare a versioned artifact with an unverified legacy artifact")
+    if contract1 and contract2:
+        for field in ("version", "dataset", "prompts_sha256", "system_prompt", "enable_thinking",
+                      "max_prompt_length", "max_new_tokens", "temperature", "top_p", "seed",
+                      "n_completions", "backend"):
+            if contract1.get(field) != contract2.get(field):
+                raise ValueError(f"Evaluation contract mismatch: {field}")
+
     # Validate that prompts match exactly
     for idx, (item1, item2) in enumerate(zip(items1, items2)):
         if item1["prompt"] != item2["prompt"]:
             raise ValueError(f"Prompt mismatch at index {idx}:\n"
                            f"File 1: {item1['prompt'][:100]}...\n"
                            f"File 2: {item2['prompt'][:100]}...")
-    
+
     # Merge into paired format
     merged_items = []
     for item1, item2 in zip(items1, items2):
@@ -121,7 +142,7 @@ def merge_completions_artifacts(meta1: Dict[str, Any], items1: List[Dict[str, st
             "completion2": item2["completion"]
         }
         merged_items.append(merged_item)
-    
+
     # Merge metadata, preferring non-None values
     merged_meta = {}
     for key in set(meta1.keys()) | set(meta2.keys()):
@@ -133,12 +154,12 @@ def merge_completions_artifacts(meta1: Dict[str, Any], items1: List[Dict[str, st
             merged_meta[key] = meta1[key]
         else:
             merged_meta[key] = meta2[key]
-    
+
     # Add information about the two source files
     merged_meta["model1_path"] = meta1.get("model_path", "model1")
     merged_meta["model2_path"] = meta2.get("model_path", "model2")
     merged_meta["merged_from_two_files"] = True
-    
+
     return merged_meta, merged_items
 
 
@@ -208,23 +229,23 @@ def extract_model_size_from_filename(filename: str) -> str:
 
 def determine_output_directory(model1_path: str, model2_path: str, default_output_dir: str) -> str:
     """Determine output directory based on dataset and model types in filenames.
-    
+
     Args:
         model1_path: Path to first model's completions file
         model2_path: Path to second model's completions file
         default_output_dir: Default output directory if conditions aren't met
-    
+
     Returns:
         Output directory path
     """
     # Extract just the filenames (without path)
     filename1 = os.path.basename(model1_path)
     filename2 = os.path.basename(model2_path)
-    
+
     # Extract dataset from both files
     dataset1 = extract_dataset_from_filename(filename1)
     dataset2 = extract_dataset_from_filename(filename2)
-    
+
     # Determine dataset to use
     if dataset1 is not None and dataset2 is not None:
         # Both have dataset keywords - they must match
@@ -243,7 +264,7 @@ def determine_output_directory(model1_path: str, model2_path: str, default_outpu
     else:
         # Neither file has dataset keyword - use default directory
         return default_output_dir
-    
+
     # Extract model types
     type1 = extract_type_from_filename(filename1)
     type2 = extract_type_from_filename(filename2)
@@ -264,7 +285,7 @@ def determine_output_directory(model1_path: str, model2_path: str, default_outpu
         subfolder = f"{model_size}-{dataset}-{type1}-vs-{type2}"
     else:
         subfolder = f"{dataset}-{type1}-vs-{type2}"
-    
+
     # Add temperature information if available
     if temp1 is not None and temp2 is not None:
         if temp1 == temp2:
@@ -275,7 +296,7 @@ def determine_output_directory(model1_path: str, model2_path: str, default_outpu
         subfolder += f"-temp{temp1}"
     elif temp2 is not None:
         subfolder += f"-temp{temp2}"
-    
+
     return os.path.join(default_output_dir, subfolder)
 
 
@@ -289,33 +310,33 @@ def generate_output_filename(model1_path: str, model2_path: str, judge_model: st
             name = name[:-6]
         elif name.endswith(".json"):
             name = name[:-5]
-        
+
         # Remove training hyperparameters: bsz, lr, warmup
         name = re.sub(r'-bsz\d+-', '-', name)
         name = re.sub(r'-lr[0-9e.-]+-', '-', name)
         name = re.sub(r'-warmup\d+-', '-', name)
-        
+
         # Remove prompts and completions information
         # Pattern: _NUMBERprompts_NUMBERcompletions_seedNUMBER or _NUMBERcompletions
         name = re.sub(r'_\d+prompts_\d+completions_seed\d+', '', name)
         name = re.sub(r'_\d+completions', '', name)
         name = re.sub(r'_\d+prompts', '', name)
-        
+
         # Clean up any double dashes that might result
         name = re.sub(r'--+', '-', name)
         name = name.strip('-')
-        
+
         return name
     model1_name = extract_name(model1_path)
     model2_name = extract_name(model2_path)
     judge_name = clean_judge_name(judge_model)
-    
+
     # Extract temperatures from full paths (not just filenames, to catch temp in directory names)
     temp1 = extract_temperature_from_filename(model1_path)
     temp2 = extract_temperature_from_filename(model2_path)
-    
+
     base = f"{model1_name}_vs_{model2_name}_{judge_name}"
-    
+
     # Add temperature information if available
     if temp1 is not None and temp2 is not None:
         if temp1 == temp2:
@@ -326,7 +347,7 @@ def generate_output_filename(model1_path: str, model2_path: str, judge_model: st
         base += f"_temp{temp1}"
     elif temp2 is not None:
         base += f"_temp{temp2}"
-    
+
     base += f"_N{N}_B{B}_seed{seed}"
     if completion_index != 0:
         base += f"_ind{completion_index}"
@@ -340,22 +361,26 @@ def parse_survey_response(response_text: str, order_swapped: bool, allow_ties: b
     """Parse the structured survey response to extract criterion evaluations."""
     criteria = ["helpfulness", "correctness", "coherence", "complexity", "verbosity"]
     criterion_evaluations = {}
-    
+
     # Accept both ``Winner: A`` and the bracketed format requested in the prompt,
     # e.g. ``Winner: [A]``.  Use explicit alternatives instead of a character
     # class so invalid strings such as "AB" cannot be interpreted as a winner.
-    winner_pattern = r"\[?\s*(A|B|Tie)\s*\]?" if allow_ties else r"\[?\s*(A|B)\s*\]?"
-    
+    winner_pattern = r"(?:\[(A|B|Tie)\]|(A|B|Tie))" if allow_ties else r"(?:\[(A|B)\]|(A|B))"
+
     # Parse each criterion
     for i, criterion in enumerate(criteria, 1):
         # Look for the criterion section (asterisks optional for robustness)
-        pattern = rf"\*?\*?{i}\.\s*{criterion.title()}\*?\*?\s*\n.*?Winner:\s*{winner_pattern}.*?Justification:\s*([^\n]+(?:\n(?!\*?\*?{i+1}\.)[^\n]*)*)"
-        match = re.search(pattern, response_text, re.IGNORECASE | re.DOTALL)
-        
+        pattern = rf"^[ \t]*\*{{0,2}}{i}\.\s*{criterion}\*{{0,2}}[ \t]*\n(.*?)(?=^[ \t]*\*{{0,2}}(?:\d+\.|Overall Recommendation:)|\Z)"
+        sections = re.findall(pattern, response_text, re.IGNORECASE | re.DOTALL | re.MULTILINE)
+        section = sections[0] if len(sections) == 1 else ""
+        winners = re.findall(rf"^[ \t]*(?:[-*][ \t]*)?Winner:[ \t]*{winner_pattern}[ \t]*$", section, re.IGNORECASE | re.MULTILINE)
+        justification_match = re.search(r"^[ \t]*(?:[-*][ \t]*)?Justification:[ \t]*(.+)", section, re.IGNORECASE | re.MULTILINE)
+        match = len(winners) == 1 and justification_match is not None
+
         if match:
-            winner_raw = match.group(1).strip().upper()
-            justification = match.group(2).strip()
-            
+            winner_raw = next(value for value in winners[0] if value).upper()
+            justification = justification_match.group(1).strip()
+
             # Map winner to model names
             if winner_raw == "A":
                 winner = "model2" if order_swapped else "model1"
@@ -368,7 +393,7 @@ def parse_survey_response(response_text: str, order_swapped: bool, allow_ties: b
                 else:
                     # This shouldn't happen with correct regex, but if it does, treat as parsing failure
                     winner = None
-            
+
             criterion_evaluations[criterion] = {
                 "winner": winner,
                 "parsing_failed": False,
@@ -381,12 +406,12 @@ def parse_survey_response(response_text: str, order_swapped: bool, allow_ties: b
                 "parsing_failed": True,
                 "justification": "Failed to parse criterion evaluation"
             }
-    
-    # Calculate survey_winner from successfully parsed criteria
+
+    # A five-dimensional score requires all five dimensions to be valid.
     successful_criteria = [eval_result for eval_result in criterion_evaluations.values() if not eval_result.get("parsing_failed", False)]
-    
-    if len(successful_criteria) == 0:
-        # All criteria failed parsing
+
+    if len(successful_criteria) != len(criteria):
+        # Incomplete surveys are invalid, not a majority over whichever parsed.
         survey_winner = None
         survey_calculation = {
             "model1_wins": 0,
@@ -394,18 +419,18 @@ def parse_survey_response(response_text: str, order_swapped: bool, allow_ties: b
             "tie_count": 0,
             "model1_score": 0.0,
             "model2_score": 0.0,
-            "successful_criteria_count": 0
+            "successful_criteria_count": len(successful_criteria)
         }
     else:
         # Count wins from successfully parsed criteria
         model1_wins = sum(1 for eval_result in successful_criteria if eval_result["winner"] == "model1")
         model2_wins = sum(1 for eval_result in successful_criteria if eval_result["winner"] == "model2")
         tie_count = sum(1 for eval_result in successful_criteria if eval_result["winner"] == "tie")
-        
+
         # Calculate scores (ties count as 0.5 each)
         model1_score = model1_wins + (tie_count * 0.5)
         model2_score = model2_wins + (tie_count * 0.5)
-        
+
         # Determine survey winner
         if model1_score > model2_score:
             survey_winner = "model1"
@@ -413,7 +438,7 @@ def parse_survey_response(response_text: str, order_swapped: bool, allow_ties: b
             survey_winner = "model2"
         else:
             survey_winner = "tie"
-        
+
         survey_calculation = {
             "model1_wins": model1_wins,
             "model2_wins": model2_wins,
@@ -422,11 +447,9 @@ def parse_survey_response(response_text: str, order_swapped: bool, allow_ties: b
             "model2_score": model2_score,
             "successful_criteria_count": len(successful_criteria)
         }
-    
+
     # Parse overall recommendation (asterisks optional for robustness)
-    # Overall recommendation is always forced to A or B, even when individual
-    # criteria allow ties. Parse only the section after its heading so a letter
-    # in ordinary prose (for example the B in "Based") cannot become a winner.
+    # Only accept a leading decision, not letters inside ordinary prose.
     overall_section_match = re.search(
         r"\*?\*?Overall Recommendation:\*?\*?\s*(.*)$",
         response_text,
@@ -435,37 +458,32 @@ def parse_survey_response(response_text: str, order_swapped: bool, allow_ties: b
     overall_match = None
     overall_section = overall_section_match.group(1).strip() if overall_section_match else ""
     if overall_section:
-        overall_match = re.search(
-            r"(?:Winner|Recommendation)\s*:\s*\[?\s*(A|B)\s*\]?",
-            overall_section,
-            re.IGNORECASE,
+        overall_match = re.match(
+            rf"\s*(?:[-*]\s*)?(?:(?:Winner|Recommendation)\s*:\s*)?{winner_pattern}(?=[ \t]*(?:[-—:]|\n|$))",
+            overall_section, re.IGNORECASE,
         )
-        if overall_match is None:
-            overall_match = re.search(
-                r"^\s*(?:[-*]\s*)?\[?\s*(A|B)\s*\]?(?=\s*(?:[-—:]|$))",
-                overall_section,
-                re.IGNORECASE,
-            )
 
     if overall_match:
-        overall_winner_raw = overall_match.group(1).strip().upper()
+        overall_winner_raw = next(value for value in overall_match.groups() if value).upper()
         overall_justification = overall_section[overall_match.end():].lstrip(" \t\r\n-—:")
         overall_justification = re.sub(
             r"^(?:Explain your reasoning\.|Reasoning:)\s*", "", overall_justification, flags=re.IGNORECASE
         ).strip() or "No separate justification supplied"
-        
+
         # Map overall winner to model names
-        # Note: Overall winner does not allow ties (only model1 or model2 are valid)
+        # Respect the same tie policy for both criterion and overall decisions.
         if overall_winner_raw == "A":
             overall_winner = "model2" if order_swapped else "model1"
         elif overall_winner_raw == "B":
             overall_winner = "model1" if order_swapped else "model2"
+        elif overall_winner_raw == "TIE" and allow_ties:
+            overall_winner = "tie"
         else:
             # If regex matched but value is not A or B, treat as parsing failure
             overall_winner = None
-        
+
         # If overall_winner is None, treat as parsing failure (even if regex matched)
-        # Overall winner should only be model1 or model2
+        # Missing/invalid decisions are never inferred from the survey majority.
         if overall_winner is None:
             overall_parsing_failed = True
         else:
@@ -475,7 +493,7 @@ def parse_survey_response(response_text: str, order_swapped: bool, allow_ties: b
         overall_winner = None
         overall_justification = "Failed to parse overall recommendation"
         overall_parsing_failed = True
-    
+
     return {
         "criterion_evaluations": criterion_evaluations,
         "overall_winner": overall_winner,
@@ -505,21 +523,21 @@ def setup_judge_client(api_key: str, api_provider: str = "auto", base_url: Optio
     return "openai", openai.OpenAI(**client_kwargs)
 
 
-def call_judge(api_type: str, judge_client, judge_model: str, prompt: str, response1: str, response2: str, 
+def call_judge(api_type: str, judge_client, judge_model: str, prompt: str, response1: str, response2: str,
                allow_ties: bool, order_swapped: bool = False, thinking_mode: str = "disabled",
                max_retries: int = 5) -> Dict[str, Any]:
     """Call the judge API with survey-based evaluation across 5 criteria."""
     # Use the predetermined order (no randomization here)
     if order_swapped:
         response1, response2 = response2, response1
-    
+
     if allow_ties:
         winner_format = "[A/B/Tie]"
         choice_instruction = ""
     else:
         winner_format = "[A/B]"
         choice_instruction = " - YOU MUST CHOOSE ONE"
-    
+
     comparison_prompt = f"""You are an expert evaluator tasked with comparing two responses to a given question. You will evaluate each response across five specific dimensions and determine which response performs better for each dimension.
 
 **Question:**
@@ -586,7 +604,8 @@ Format your evaluation as follows:
 - Justification: [explanation]
 
 **Overall Recommendation:**
-Based on the five dimensions above, which response would you recommend overall? {winner_format}{choice_instruction} - Explain your reasoning."""
+Winner: {winner_format}
+Justification: [Explain your overall recommendation based on the five dimensions.]"""
 
     last_error = None
     for attempt in range(max_retries):
@@ -694,36 +713,36 @@ def analyze_bootstrap_results(bootstrap_results: List[Dict[str, Any]]) -> Dict[s
     """Analyze bootstrap results to calculate win rate distributions and confidence intervals."""
     if not bootstrap_results:
         return {}
-    
+
     if np is None:
         raise ImportError("numpy is required for statistical analysis. Please install it with: pip install numpy")
-    
+
     # Calculate confidence intervals using percentile method
     def calculate_ci(data, confidence=0.95):
         alpha = 1 - confidence
         lower = np.percentile(data, (alpha/2) * 100)
         upper = np.percentile(data, (1 - alpha/2) * 100)
         return [float(lower), float(upper)]
-    
+
     # Extract overall winner win rates (exclude iterations with 0 valid comparisons)
     model1_overall_win_rates = []
     model2_overall_win_rates = []
     overall_exclusion_rates = []
-    
+
     # Extract survey winner win rates (exclude iterations with 0 valid comparisons)
     model1_survey_win_rates = []
     model2_survey_win_rates = []
     survey_tie_rates = []
     survey_exclusion_rates = []
-    
+
     overall_iterations_excluded = 0
     survey_iterations_excluded = 0
-    
+
     for iteration_result in bootstrap_results:
         analysis = iteration_result["analysis"]
         overall_analysis = analysis["overall_analysis"]
         survey_analysis = analysis["survey_analysis"]
-        
+
         # Overall winner statistics - only include iterations with valid comparisons > 0
         if overall_analysis["valid_comparisons"] > 0:
             model1_overall_win_rates.append(overall_analysis["model1_win_rate"])
@@ -732,7 +751,8 @@ def analyze_bootstrap_results(bootstrap_results: List[Dict[str, Any]]) -> Dict[s
             overall_exclusion_rates.append(overall_analysis["excluded"] / total if total > 0 else 0)
         else:
             overall_iterations_excluded += 1
-        
+            overall_exclusion_rates.append(1.0)
+
         # Survey winner statistics - only include iterations with valid comparisons > 0
         if survey_analysis["valid_comparisons"] > 0:
             model1_survey_win_rates.append(survey_analysis["model1_win_rate"])
@@ -742,30 +762,31 @@ def analyze_bootstrap_results(bootstrap_results: List[Dict[str, Any]]) -> Dict[s
             survey_exclusion_rates.append(survey_analysis["excluded"] / total if total > 0 else 0)
         else:
             survey_iterations_excluded += 1
-    
+            survey_exclusion_rates.append(1.0)
+
     # Convert to numpy arrays (may be empty if all iterations excluded)
     model1_overall_win_rates = np.array(model1_overall_win_rates) if model1_overall_win_rates else np.array([])
     model2_overall_win_rates = np.array(model2_overall_win_rates) if model2_overall_win_rates else np.array([])
     overall_exclusion_rates = np.array(overall_exclusion_rates) if overall_exclusion_rates else np.array([])
-    
+
     model1_survey_win_rates = np.array(model1_survey_win_rates) if model1_survey_win_rates else np.array([])
     model2_survey_win_rates = np.array(model2_survey_win_rates) if model2_survey_win_rates else np.array([])
     survey_tie_rates = np.array(survey_tie_rates) if survey_tie_rates else np.array([])
     survey_exclusion_rates = np.array(survey_exclusion_rates) if survey_exclusion_rates else np.array([])
-    
+
     # Helper function to calculate stats safely (handles empty arrays)
     def safe_stats(data, include_ci_99=True):
         if len(data) == 0:
             result = {
-                "mean": 0.0,
-                "std": 0.0,
-                "min": 0.0,
-                "max": 0.0,
-                "ci_95": [0.0, 0.0],
+                "mean": None,
+                "std": None,
+                "min": None,
+                "max": None,
+                "ci_95": [None, None],
                 "raw_values": []
             }
             if include_ci_99:
-                result["ci_99"] = [0.0, 0.0]
+                result["ci_99"] = [None, None]
             return result
         result = {
             "mean": float(np.mean(data)),
@@ -778,7 +799,7 @@ def analyze_bootstrap_results(bootstrap_results: List[Dict[str, Any]]) -> Dict[s
         if include_ci_99:
             result["ci_99"] = calculate_ci(data, 0.99)
         return result
-    
+
     return {
         "bootstrap_iterations": len(bootstrap_results),
         "overall_winner_analysis": {
@@ -800,7 +821,7 @@ def analyze_bootstrap_results(bootstrap_results: List[Dict[str, Any]]) -> Dict[s
 
 
 def _cache_key(item: Dict[str, str], api_type: str, judge_model: str, allow_ties: bool,
-               order_swapped: bool, thinking_mode: str) -> str:
+               order_swapped: bool, thinking_mode: str, base_url: str = "") -> str:
     payload = {
         "prompt": item["prompt"],
         "completion1": item["completion1"],
@@ -810,6 +831,9 @@ def _cache_key(item: Dict[str, str], api_type: str, judge_model: str, allow_ties
         "allow_ties": allow_ties,
         "order_swapped": order_swapped,
         "thinking_mode": thinking_mode,
+        "base_url": base_url.rstrip("/"),
+        "protocol_version": JUDGE_PROTOCOL_VERSION,
+        "parser_version": JUDGE_PARSER_VERSION,
     }
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
@@ -842,9 +866,11 @@ def _append_judgment_cache(cache_path: str, cache_key: str, result: Dict[str, An
 
 
 def _analyze_iteration(iteration_results: List[Dict[str, Any]]) -> Dict[str, Any]:
-    valid_overall = [result for result in iteration_results if not result.get("overall_parsing_failed", False)]
+    valid_overall = [result for result in iteration_results if not result.get("overall_parsing_failed", False)
+                     and result.get("overall_winner") in ("model1", "model2", "tie")]
     model1_overall_wins = sum(result.get("overall_winner") == "model1" for result in valid_overall)
     model2_overall_wins = sum(result.get("overall_winner") == "model2" for result in valid_overall)
+    overall_ties = sum(result.get("overall_winner") == "tie" for result in valid_overall)
 
     valid_survey = [result for result in iteration_results if result.get("survey_winner") is not None]
     model1_survey_wins = sum(result.get("survey_winner") == "model1" for result in valid_survey)
@@ -858,6 +884,8 @@ def _analyze_iteration(iteration_results: List[Dict[str, Any]]) -> Dict[str, Any
             "excluded": len(iteration_results) - len(valid_overall),
             "model1_wins": model1_overall_wins,
             "model2_wins": model2_overall_wins,
+            "ties": overall_ties,
+            "tie_rate": overall_ties / len(valid_overall) if valid_overall else None,
             "model1_win_rate": model1_overall_wins / len(valid_overall) if valid_overall else 0,
             "model2_win_rate": model2_overall_wins / len(valid_overall) if valid_overall else 0,
         },
@@ -879,7 +907,7 @@ def run_bootstrap_evaluation(meta1: Dict[str, Any], items1: List[Dict[str, str]]
                              N: int, B: int, judge_model: str, api_type: str, judge_client,
                              allow_ties: bool, seed: int, cache_path: str,
                              thinking_mode: str = "disabled", refresh_cache: bool = False,
-                             max_retries: int = 5) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[int]]:
+                             max_retries: int = 5, base_url: str = "") -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[int]]:
     """Judge N unique pairs once, then perform all B bootstrap resamples locally."""
     if np is None:
         raise ImportError("numpy is required for bootstrap sampling. Please install it with: pip install numpy")
@@ -900,7 +928,7 @@ def run_bootstrap_evaluation(meta1: Dict[str, Any], items1: List[Dict[str, str]]
     for source_index in tqdm(selected_indices, desc="LLM judge calls"):
         item = all_items[source_index]
         order_swapped = selection_rng.choice([True, False])
-        cache_key = _cache_key(item, api_type, judge_model, allow_ties, order_swapped, thinking_mode)
+        cache_key = _cache_key(item, api_type, judge_model, allow_ties, order_swapped, thinking_mode, base_url)
         cached_result = cached_results.get(cache_key)
         if cached_result is None:
             judgment = call_judge(
@@ -931,15 +959,16 @@ def run_bootstrap_evaluation(meta1: Dict[str, Any], items1: List[Dict[str, str]]
                 "source_index": source_index,
                 "cache_key": cache_key,
             }
-            # A transport/API failure should be retried on the next run instead of
-            # becoming a permanent cache hit. A successfully returned but unusually
-            # formatted judgment is retained and can be replaced with --refresh-cache.
-            if "parse_error" not in judgment:
+            # Cache only valid decisions; API and parse failures are retried on
+            # the next run, while their raw evidence remains in the result JSON.
+            if "parse_error" not in judgment and not judgment.get("overall_parsing_failed", True) and judgment.get("survey_winner") is not None:
                 _append_judgment_cache(cache_path, cache_key, result)
+                cached_results[cache_key] = result
             result["cache_hit"] = False
         else:
             result = dict(cached_result)
             result["cache_hit"] = True
+            result["source_index"] = source_index
         judged_results.append(result)
 
     bootstrap_rng = np.random.default_rng(seed)
@@ -956,22 +985,26 @@ def run_bootstrap_evaluation(meta1: Dict[str, Any], items1: List[Dict[str, str]]
     return bootstrap_results, judged_results, selected_indices
 
 
-def save_bootstrap_results(output_path: str, model1_path: str, model2_path: str, judge_model: str, 
-                          api_type: str, seed: int, N: int, B: int, allow_ties: bool, 
+def save_bootstrap_results(output_path: str, model1_path: str, model2_path: str, judge_model: str,
+                          api_type: str, seed: int, N: int, B: int, allow_ties: bool,
                           bootstrap_results: List[Dict[str, Any]], bootstrap_analysis: Dict[str, Any],
                           judged_results: List[Dict[str, Any]], selected_indices: List[int],
                           cache_path: str, base_url: Optional[str], thinking_mode: str,
-                          completion_index: int = 0) -> None:
+                          completion_index: int = 0, validation: Optional[Dict[str, Any]] = None) -> None:
     """Save comprehensive bootstrap results to JSON file."""
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+
     usage_totals = {"input_tokens": 0, "output_tokens": 0, "cached_input_tokens": 0}
     for result in judged_results:
+        if result.get("cache_hit"):
+            continue
         usage = result.get("judgment", {}).get("api_usage", {})
         for key in usage_totals:
             usage_totals[key] += int(usage.get(key, 0) or 0)
 
     payload = {
+        "status": "success" if validation and validation["passed"] else "invalid",
+        "validation": validation,
         "bootstrap_config": {
             "model1_path": model1_path,
             "model2_path": model2_path,
@@ -984,6 +1017,8 @@ def save_bootstrap_results(output_path: str, model1_path: str, model2_path: str,
             "completion_index_used": completion_index,
             "thinking_mode": thinking_mode,
             "base_url": base_url,
+            "protocol_version": JUDGE_PROTOCOL_VERSION,
+            "parser_version": JUDGE_PARSER_VERSION,
             "cache_path": os.path.abspath(cache_path),
             "methodology": "judge_N_unique_pairs_once_then_bootstrap_locally_with_replacement"
         },
@@ -1005,8 +1040,8 @@ def save_bootstrap_results(output_path: str, model1_path: str, model2_path: str,
     print(f"Bootstrap results saved to {output_path}")
 
 
-def print_bootstrap_summary(model1_path: str, model2_path: str, judge_model: str, 
-                           N: int, B: int, allow_ties: bool, 
+def print_bootstrap_summary(model1_path: str, model2_path: str, judge_model: str,
+                           N: int, B: int, allow_ties: bool,
                            bootstrap_analysis: Dict[str, Any]) -> None:
     """Print comprehensive summary of bootstrap evaluation results."""
     print("\n" + "=" * 100)
@@ -1019,36 +1054,39 @@ def print_bootstrap_summary(model1_path: str, model2_path: str, judge_model: str
     print(f"  - Subsample size (N): {N}")
     print(f"  - Bootstrap iterations (B): {B}")
     print(f"  - Allow ties: {allow_ties}")
-    
+
     overall_analysis = bootstrap_analysis["overall_winner_analysis"]
     survey_analysis = bootstrap_analysis["survey_winner_analysis"]
-    
+    if not overall_analysis["iterations_with_valid_comparisons"] or not survey_analysis["iterations_with_valid_comparisons"]:
+        print("INVALID evaluation: no valid overall or complete five-criterion judgments; no winner or confidence interval.")
+        return
+
     # Overall winner statistics
     print(f"\n{'='*100}")
     print("OVERALL WINNER ANALYSIS (from explicit Overall Recommendation)")
     print(f"{'='*100}")
-    
+
     model1_overall_dist = overall_analysis["model1_win_rate_distribution"]
     model2_overall_dist = overall_analysis["model2_win_rate_distribution"]
     overall_exclusion_dist = overall_analysis["exclusion_rate_distribution"]
-    
+
     print(f"\nModel 1 Overall Win Rate:")
     print(f"  Mean: {model1_overall_dist['mean']:.3f} ± {model1_overall_dist['std']:.3f}")
     print(f"  95% CI: [{model1_overall_dist['ci_95'][0]:.3f}, {model1_overall_dist['ci_95'][1]:.3f}]")
     print(f"  99% CI: [{model1_overall_dist['ci_99'][0]:.3f}, {model1_overall_dist['ci_99'][1]:.3f}]")
     print(f"  Range: [{model1_overall_dist['min']:.3f}, {model1_overall_dist['max']:.3f}]")
-    
+
     print(f"\nModel 2 Overall Win Rate:")
     print(f"  Mean: {model2_overall_dist['mean']:.3f} ± {model2_overall_dist['std']:.3f}")
     print(f"  95% CI: [{model2_overall_dist['ci_95'][0]:.3f}, {model2_overall_dist['ci_95'][1]:.3f}]")
     print(f"  99% CI: [{model2_overall_dist['ci_99'][0]:.3f}, {model2_overall_dist['ci_99'][1]:.3f}]")
     print(f"  Range: [{model2_overall_dist['min']:.3f}, {model2_overall_dist['max']:.3f}]")
-    
+
     print(f"\nOverall Parsing Failure Rate:")
     print(f"  Mean: {overall_exclusion_dist['mean']:.3f} ± {overall_exclusion_dist['std']:.3f}")
     print(f"  95% CI: [{overall_exclusion_dist['ci_95'][0]:.3f}, {overall_exclusion_dist['ci_95'][1]:.3f}]")
     print(f"  Range: [{overall_exclusion_dist['min']:.3f}, {overall_exclusion_dist['max']:.3f}]")
-    
+
     # Determine overall winner
     if model1_overall_dist['mean'] > model2_overall_dist['mean']:
         print(f"\n🏆 Overall Winner: Model 1 (mean win rate: {model1_overall_dist['mean']:.3f})")
@@ -1056,40 +1094,40 @@ def print_bootstrap_summary(model1_path: str, model2_path: str, judge_model: str
         print(f"\n🏆 Overall Winner: Model 2 (mean win rate: {model2_overall_dist['mean']:.3f})")
     else:
         print(f"\n🤝 Overall Result: Tie (both models: {model1_overall_dist['mean']:.3f})")
-    
+
     # Survey winner statistics
     print(f"\n{'='*100}")
     print("SURVEY WINNER ANALYSIS (from criterion majority)")
     print(f"{'='*100}")
-    
+
     model1_survey_dist = survey_analysis["model1_win_rate_distribution"]
     model2_survey_dist = survey_analysis["model2_win_rate_distribution"]
     survey_tie_dist = survey_analysis["tie_rate_distribution"]
     survey_exclusion_dist = survey_analysis["exclusion_rate_distribution"]
-    
+
     print(f"\nModel 1 Survey Win Rate:")
     print(f"  Mean: {model1_survey_dist['mean']:.3f} ± {model1_survey_dist['std']:.3f}")
     print(f"  95% CI: [{model1_survey_dist['ci_95'][0]:.3f}, {model1_survey_dist['ci_95'][1]:.3f}]")
     print(f"  99% CI: [{model1_survey_dist['ci_99'][0]:.3f}, {model1_survey_dist['ci_99'][1]:.3f}]")
     print(f"  Range: [{model1_survey_dist['min']:.3f}, {model1_survey_dist['max']:.3f}]")
-    
+
     print(f"\nModel 2 Survey Win Rate:")
     print(f"  Mean: {model2_survey_dist['mean']:.3f} ± {model2_survey_dist['std']:.3f}")
     print(f"  95% CI: [{model2_survey_dist['ci_95'][0]:.3f}, {model2_survey_dist['ci_95'][1]:.3f}]")
     print(f"  99% CI: [{model2_survey_dist['ci_99'][0]:.3f}, {model2_survey_dist['ci_99'][1]:.3f}]")
     print(f"  Range: [{model2_survey_dist['min']:.3f}, {model2_survey_dist['max']:.3f}]")
-    
+
     print(f"\nSurvey Tie Rate:")
     print(f"  Mean: {survey_tie_dist['mean']:.3f} ± {survey_tie_dist['std']:.3f}")
     print(f"  95% CI: [{survey_tie_dist['ci_95'][0]:.3f}, {survey_tie_dist['ci_95'][1]:.3f}]")
     print(f"  99% CI: [{survey_tie_dist['ci_99'][0]:.3f}, {survey_tie_dist['ci_99'][1]:.3f}]")
     print(f"  Range: [{survey_tie_dist['min']:.3f}, {survey_tie_dist['max']:.3f}]")
-    
+
     print(f"\nSurvey Exclusion Rate (all criteria failed):")
     print(f"  Mean: {survey_exclusion_dist['mean']:.3f} ± {survey_exclusion_dist['std']:.3f}")
     print(f"  95% CI: [{survey_exclusion_dist['ci_95'][0]:.3f}, {survey_exclusion_dist['ci_95'][1]:.3f}]")
     print(f"  Range: [{survey_exclusion_dist['min']:.3f}, {survey_exclusion_dist['max']:.3f}]")
-    
+
     # Determine survey winner
     if model1_survey_dist['mean'] > model2_survey_dist['mean']:
         print(f"\n🏆 Survey Winner: Model 1 (mean win rate: {model1_survey_dist['mean']:.3f})")
@@ -1097,7 +1135,7 @@ def print_bootstrap_summary(model1_path: str, model2_path: str, judge_model: str
         print(f"\n🏆 Survey Winner: Model 2 (mean win rate: {model2_survey_dist['mean']:.3f})")
     else:
         print(f"\n🤝 Survey Result: Tie (both models: {model1_survey_dist['mean']:.3f})")
-    
+
     print("=" * 100)
 
 
@@ -1117,6 +1155,8 @@ def main():
     )
     parser.add_argument("--thinking-mode", choices=["enabled", "disabled"], default="disabled")
     parser.add_argument("--max-retries", type=int, default=5)
+    parser.add_argument("--min-valid-fraction", type=float, default=1.0,
+                        help="Required valid overall AND full-survey fraction (default: all judgments)")
     parser.add_argument("--N", type=int, default=100, help="Number of unique prompt pairs sent to the judge")
     parser.add_argument("--B", type=int, default=1000, help="Number of local bootstrap resamples")
     tie_group = parser.add_mutually_exclusive_group()
@@ -1128,17 +1168,19 @@ def main():
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--completion-index", type=int, default=0, help="Which completion to use from multi-completion files (0=first, 1=second, etc.)")
     args = parser.parse_args()
+    if not 0 < args.min_valid_fraction <= 1 or args.max_retries < 1:
+        parser.error("min-valid-fraction must be in (0, 1] and max-retries must be positive")
 
     # Load both completion files
     print(f"Loading completions from: {args.completions1}")
     print(f"Using completion index: {args.completion_index} (0=first, 1=second, etc.)")
     meta1, items1 = read_single_completions_artifact(args.completions1, completion_index=args.completion_index)
     print(f"Loaded {len(items1)} completions from first file")
-    
+
     print(f"Loading completions from: {args.completions2}")
     meta2, items2 = read_single_completions_artifact(args.completions2, completion_index=args.completion_index)
     print(f"Loaded {len(items2)} completions from second file")
-    
+
     allow_ties = args.allow_ties
 
     output_dir = determine_output_directory(args.completions1, args.completions2, args.output_dir)
@@ -1160,6 +1202,7 @@ def main():
 
     # Setup judge client
     api_type, judge_client = setup_judge_client(api_key, args.api_provider, resolved_base_url)
+    resolved_base_url = str(getattr(judge_client, "base_url", resolved_base_url or ""))
     print(f"Using {api_type.upper()} API with judge model: {args.judge_model}")
 
     cache_path = args.cache_path or os.path.join(
@@ -1168,17 +1211,28 @@ def main():
 
     # Run bootstrap evaluation
     bootstrap_results, judged_results, selected_indices = run_bootstrap_evaluation(
-        meta1, items1, meta2, items2, 
+        meta1, items1, meta2, items2,
         args.N, args.B, args.judge_model, api_type, judge_client,
         allow_ties, args.seed, cache_path,
         thinking_mode=args.thinking_mode,
         refresh_cache=args.refresh_cache,
         max_retries=args.max_retries,
+        base_url=resolved_base_url,
     )
-    
+
     # Analyze bootstrap results
     bootstrap_analysis = analyze_bootstrap_results(bootstrap_results)
-    
+    observed = _analyze_iteration(judged_results)
+    validation = {
+        "required_fraction": args.min_valid_fraction,
+        "overall_valid": observed["overall_analysis"]["valid_comparisons"],
+        "survey_valid": observed["survey_analysis"]["valid_comparisons"],
+        "total": len(judged_results),
+        "observed": observed,
+    }
+    validation["passed"] = all(validation[key] >= max(2, args.min_valid_fraction * len(judged_results))
+                                for key in ("overall_valid", "survey_valid"))
+
     # Generate output filename and save results
     filename = generate_output_filename(
         args.completions1,
@@ -1191,7 +1245,7 @@ def main():
         completion_index=args.completion_index
     )
     output_path = os.path.join(output_dir, filename)
-    
+
     save_bootstrap_results(
         output_path,
         args.completions1,
@@ -1209,10 +1263,14 @@ def main():
         cache_path,
         resolved_base_url,
         args.thinking_mode,
-        completion_index=args.completion_index
+        completion_index=args.completion_index,
+        validation=validation,
     )
-    
+
     # Print summary
+    if not validation["passed"]:
+        print(f"INVALID evaluation: {validation}. Evidence saved; fix failures and retry. No winner declared.")
+        return 1
     print_bootstrap_summary(
         meta1.get("model_path", "model1"),
         meta2.get("model_path", "model2"),
@@ -1222,7 +1280,8 @@ def main():
         allow_ties,
         bootstrap_analysis
     )
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

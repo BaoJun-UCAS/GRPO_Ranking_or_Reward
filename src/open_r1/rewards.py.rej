@@ -1,0 +1,9 @@
+--- src/open_r1/rewards.py
++++ src/open_r1/rewards.py
+@@ -695,5 +695,6 @@
+ 
+     qrm_server_reward.__name__ = "qrm_server"
+     return qrm_server_reward
+ 
++
+ def get_reward_funcs(script_args) -> list[Callable]:

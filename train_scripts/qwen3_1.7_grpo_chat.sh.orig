@@ -72,13 +72,12 @@ cd "${PROJECT_ROOT}"
 PYTHON="${PYTHON:-python}"
 
 # Default: GPU 4 serves vLLM, GPU 5 serves QRM, and GPUs 6-7 train.
-# Reject the old singular alias so a stale VLLM_GPU=0 cannot silently defeat
-# the four-GPU split. Intentional alternate layouts use VLLM_GPUS explicitly.
-if [[ -n "${VLLM_GPU+x}" ]]; then
-    echo 'VLLM_GPU is no longer supported; unset it and use VLLM_GPUS (default: 4).' >&2
+# VLLM_GPU remains a compatibility alias for existing single-GPU commands.
+if [[ -n "${VLLM_GPUS+x}" && -n "${VLLM_GPU+x}" && "${VLLM_GPUS// /}" != "${VLLM_GPU// /}" ]]; then
+    echo 'VLLM_GPUS and legacy VLLM_GPU disagree; set only VLLM_GPUS.' >&2
     exit 2
 fi
-VLLM_GPUS="${VLLM_GPUS:-4}"
+VLLM_GPUS="${VLLM_GPUS:-${VLLM_GPU:-4}}"
 VLLM_GPUS="${VLLM_GPUS// /}"
 QRM_GPU="${QRM_GPU:-5}"
 TRAIN_GPUS="${TRAIN_GPUS:-6,7}"

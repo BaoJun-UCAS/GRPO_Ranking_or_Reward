@@ -1,0 +1,157 @@
+"""Single-GPU HTTP service for sequence-classification reward models."""
+
+import argparse
+import asyncio
+import math
+from typing import Annotated, Literal, Protocol
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+
+class ChatMessage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    role: Literal["system", "user", "assistant"]
+    content: str
+
+
+class ScoreRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    messages: list[Annotated[list[ChatMessage], Field(min_length=1)]] = Field(min_length=1, max_length=4096)
+
+    @model_validator(mode="after")
+    def completions_are_present(self):
+        for conversation in self.messages:
+            if conversation[-1].role != "assistant":
+                raise ValueError("Each conversation must end with an assistant completion")
+        return self
+
+
+class RewardScorer(Protocol):
+    def score(self, messages: list[list[dict[str, str]]]) -> list[float]: ...
+
+
+def create_app(scorer: RewardScorer, run_id: str | None = None) -> FastAPI:
+    """Create an API that serializes all GPU work through one model instance."""
+
+    app = FastAPI()
+    inference_lock = asyncio.Lock()
+
+    @app.get("/health/")
+    async def health():
+        return {"status": "ok"}
+
+    @app.get("/health/{requested_run_id}/")
+    async def owned_health(requested_run_id: str):
+        if run_id is None or requested_run_id != run_id:
+            raise HTTPException(status_code=404, detail="Unknown run")
+        return {"status": "ok"}
+
+    @app.post("/score/")
+    async def score(request: ScoreRequest):
+        messages = [[message.model_dump() for message in item] for item in request.messages]
+        async with inference_lock:
+            rewards = await asyncio.to_thread(scorer.score, messages)
+        if len(rewards) != len(messages) or not all(math.isfinite(float(value)) for value in rewards):
+            raise RuntimeError("Reward model returned an invalid result")
+        return {"rewards": [float(value) for value in rewards]}
+
+    return app
+
+
+class TransformersRewardScorer:
+    def __init__(self, model, tokenizer, device: str, batch_size: int, max_length: int):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.device = device
+        self.batch_size = batch_size
+        self.max_length = max_length
+
+    def score(self, messages: list[list[dict[str, str]]]) -> list[float]:
+        import torch
+        from trl.data_utils import apply_chat_template
+
+        texts = [apply_chat_template({"messages": item}, self.tokenizer)["text"] for item in messages]
+        rewards = []
+        for start in range(0, len(texts), self.batch_size):
+            inputs = self.tokenizer(
+                text=texts[start : start + self.batch_size],
+                return_tensors="pt",
+                padding=True,
+                padding_side="right",
+                truncation=True,
+                max_length=self.max_length,
+                add_special_tokens=False,
+            )
+            inputs = {name: value.to(self.device) for name, value in inputs.items()}
+            with torch.inference_mode():
+                logits = self.model(**inputs).logits[:, 0]
+            rewards.extend(logits.float().cpu().tolist())
+        return rewards
+
+
+def parse_args(argv=None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--revision", default="main")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8001)
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--max-length", type=int, default=4096)
+    parser.add_argument("--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16")
+    parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--run-id")
+    parser.add_argument(
+        "--log-level", choices=("critical", "error", "warning", "info", "debug", "trace"), default="info"
+    )
+    args = parser.parse_args(argv)
+    if not 1 <= args.port <= 65535:
+        parser.error("--port must be between 1 and 65535")
+    if args.batch_size < 1:
+        parser.error("--batch-size must be positive")
+    if args.max_length < 1:
+        parser.error("--max-length must be positive")
+    return args
+
+
+def main() -> None:
+    args = parse_args()
+
+    import torch
+    import uvicorn
+    from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+    dtype = getattr(torch, args.dtype)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model,
+        revision=args.revision,
+        trust_remote_code=True,
+    )
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    # Preserve the completion and the most recent context if an example must
+    # be shortened to the explicitly configured reward-model context window.
+    tokenizer.truncation_side = "left"
+    model = AutoModelForSequenceClassification.from_pretrained(
+        args.model,
+        revision=args.revision,
+        num_labels=1,
+        trust_remote_code=True,
+        attn_implementation="flash_attention_2",
+        torch_dtype=dtype,
+    )
+    model.config.pad_token_id = tokenizer.pad_token_id
+    model.config.use_cache = False
+    model.to(args.device)
+    model.eval()
+    scorer = TransformersRewardScorer(model, tokenizer, args.device, args.batch_size, args.max_length)
+    # Fail before advertising readiness if remote code, the chat template,
+    # FlashAttention, or final-token scoring is incompatible.
+    scorer.score([[{"role": "user", "content": "Warmup"}, {"role": "assistant", "content": "OK"}]])
+    uvicorn.run(create_app(scorer, run_id=args.run_id), host=args.host, port=args.port, log_level=args.log_level)
+
+
+if __name__ == "__main__":
+    main()
