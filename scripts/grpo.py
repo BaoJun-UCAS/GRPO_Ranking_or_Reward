@@ -178,9 +178,16 @@ def launch(args):
     if args.command == "smoke":
         # Keep explicit user overrides. The launcher derives the generation batch
         # from GPU count, per-device batch and accumulation if it is unspecified.
-        defaults = {"MAX_STEPS": "2", "GRADIENT_ACCUMULATION_STEPS": "8", "MAX_PROMPT_LENGTH": "512",
-                    "MAX_COMPLETION_LENGTH": "256", "QRM_MAX_LENGTH": "1024", "REWARD_BATCH_SIZE": "1",
-                    "MERGE_AFTER_TRAINING": "0"}
+        defaults = {
+            "MAX_STEPS": "2",
+            "GRADIENT_ACCUMULATION_STEPS": "8",
+            "MAX_PROMPT_LENGTH": "2048",
+            "MAX_COMPLETION_LENGTH": "3072",
+            "VLLM_MAX_MODEL_LEN": "6144",
+            "QRM_MAX_LENGTH": "6144",
+            "REWARD_BATCH_SIZE": "1",
+            "MERGE_AFTER_TRAINING": "0",
+        }
         for key, value in defaults.items():
             env.setdefault(key, value)
     command = ["bash", str(ROOT / "train_scripts/qwen3_1.7_grpo_chat.sh")]

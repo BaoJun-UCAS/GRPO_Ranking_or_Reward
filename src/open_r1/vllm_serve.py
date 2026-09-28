@@ -284,6 +284,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--enforce_eager", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--log_level", default="info", choices=("critical", "error", "warning", "info", "debug", "trace"))
     parser.add_argument("--shutdown_timeout", type=float, default=10.0)
+    parser.add_argument("--run-id")
     args = parser.parse_args(argv)
     if not 1 <= args.port <= 65535:
         parser.error("--port must be between 1 and 65535")
@@ -293,7 +294,6 @@ def parse_args(argv=None) -> argparse.Namespace:
         parser.error("--gpu_memory_utilization must be greater than 0 and at most 1")
     if args.max_model_len is not None and args.max_model_len < 1:
         parser.error("--max_model_len must be positive")
-    parser.add_argument("--run-id")
     if not 0 < args.shutdown_timeout < float("inf"):
         parser.error("--shutdown_timeout must be finite and positive")
     return args
