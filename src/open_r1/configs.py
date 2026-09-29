@@ -187,6 +187,18 @@ class GRPOConfig(trl.GRPOConfig):
         default=51216,
         metadata={"help": "NCCL weight-sync port for vLLM server mode; use a distinct port per experiment."},
     )
+    use_cpu_object_collectives: bool = field(
+        default=False,
+        metadata={"help": "Use a Gloo control group for Python-object gather/broadcast when available."},
+    )
+    trim_unused_padding: bool = field(
+        default=False,
+        metadata={"help": "Trim all-padding prompt/completion columns after splitting generation micro-batches."},
+    )
+    profile_stage_timings: bool = field(
+        default=False,
+        metadata={"help": "Log per-rank rollout, reward, synchronization, and policy-step wall times."},
+    )
 
 
 @dataclass

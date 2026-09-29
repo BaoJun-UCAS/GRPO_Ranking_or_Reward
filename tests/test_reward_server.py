@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 import httpx
 
-from open_r1.reward_server import create_app, parse_args
+from open_r1.reward_server import build_length_aware_batches, create_app, parse_args
 from open_r1.rewards import get_remote_qrm_reward
 
 
@@ -115,14 +115,37 @@ class RewardClientTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "non-finite"):
                 reward([[{"role": "user", "content": "q"}]], [[{"role": "assistant", "content": "a"}]])
 
+    def test_length_aware_batches_preserve_examples_and_bound_padding(self):
+        lengths = [500, 100, 120, 510, 900]
+        batches = build_length_aware_batches(lengths, max_batch_size=2, max_batch_tokens=1000)
+        flattened = [index for batch in batches for index in batch]
+        self.assertCountEqual(flattened, range(len(lengths)))
+        for batch in batches:
+            self.assertLessEqual(len(batch), 2)
+            if len(batch) > 1:
+                self.assertLessEqual(len(batch) * max(lengths[index] for index in batch), 1000)
+
+    def test_length_aware_batches_reject_an_unenforceable_single_example(self):
+        with self.assertRaisesRegex(ValueError, "exceeds the padded-token budget"):
+            build_length_aware_batches([1001], max_batch_size=2, max_batch_tokens=1000)
+
     def test_server_argument_validation(self):
         args = parse_args(["--model", "qrm"])
-        self.assertEqual((args.port, args.batch_size, args.max_length), (8001, 1, 4096))
-        for option, value in (("--port", "0"), ("--batch-size", "0"), ("--max-length", "0")):
+        self.assertEqual((args.port, args.batch_size, args.max_batch_tokens, args.max_length), (8001, 1, 0, 4096))
+        for option, value in (
+            ("--port", "0"),
+            ("--batch-size", "0"),
+            ("--max-batch-tokens", "-1"),
+            ("--max-length", "0"),
+        ):
             with self.subTest(option=option), contextlib.redirect_stderr(io.StringIO()):
                 with self.assertRaises(SystemExit) as raised:
                     parse_args(["--model", "qrm", option, value])
                 self.assertEqual(raised.exception.code, 2)
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as raised:
+                parse_args(["--model", "qrm", "--max-length", "1024", "--max-batch-tokens", "512"])
+            self.assertEqual(raised.exception.code, 2)
 
 
 if __name__ == "__main__":

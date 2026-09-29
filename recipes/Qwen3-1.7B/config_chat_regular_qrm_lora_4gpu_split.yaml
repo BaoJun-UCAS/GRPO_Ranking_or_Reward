@@ -30,6 +30,9 @@ system_prompt: ""
 bf16: true
 use_vllm: true
 vllm_mode: server
+use_cpu_object_collectives: true
+trim_unused_padding: true
+profile_stage_timings: true
 vllm_server_base_url: http://127.0.0.1:${VLLM_HTTP_PORT}
 vllm_group_port: ${VLLM_GROUP_PORT}
 vllm_server_timeout: 600

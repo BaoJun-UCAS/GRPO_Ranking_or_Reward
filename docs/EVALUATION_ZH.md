@@ -2,6 +2,23 @@
 
 这里区分两条流程：训练内 `trainer.evaluate()` 使用验证集和训练奖励；离线评测比较基础模型与训练模型在相同测试 prompt 上的回答，再交给独立 judge。两者不能互相替代，也不能把训练完成或 API 返回成功当作评测有效。
 
+## 训练运行验收
+
+训练进程正常退出后，先做不加载模型、不占 GPU 的产物与性能证据验收：
+
+```bash
+python scripts/grpo.py validate --run-dir /path/to/training-run
+# 如果本次运行约定生成 merged_model：
+python scripts/grpo.py validate --run-dir /path/to/training-run --require-merged
+```
+
+未指定 `--run-dir` 时按 `RUN_DIR`、`RUN_NAME`、输出根目录下最新 run 的顺序选择。验收器检查 `RUN_STATUS`、resolved YAML、manifest、最终步数和有限 loss、adapter/完整模型权重、关键日志、每个 rank 的 timing min/max/spread，以及 QRM 动态分批是否超过 `REWARD_BATCH_SIZE` 或 `QRM_MAX_BATCH_TOKENS`。结果原子写入 `validation_report.json`，任何硬错误都返回非零退出码。
+
+四卡 launcher 已自动执行相同验收：训练产物不完整或指标不一致时不会把 run 标成成功；开启 LoRA 合并时还会再次检查 merged model。`--allow-running` 仅供 launcher 在写最终 `RUN_STATUS` 前内部使用，不应当作手工绕过失败状态的选项。
+
+报告中的 stage share 是计时证据的汇总，用于定位 rollout、QRM、policy 或其它同步开销；它不能证明模型质量、收敛性、奖励无偏，也不能替代真实 GPU smoke 和下方独立对比评测。
+
+
 ## 训练过程曲线
 
 仓库提供完全离线的 Trainer/GRPO 指标绘图，不读取权重、不占用 GPU：

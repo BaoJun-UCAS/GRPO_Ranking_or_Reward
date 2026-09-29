@@ -28,7 +28,7 @@ def launch_env(tmp_path):
         "HF_USERNAME", "HF_HOME", "HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE", "HF_DATASETS_CACHE",
         "GRPO_CACHE_ROOT", "RUN_DIR", "GENERATION_BATCH_SIZE", "CONFIG_FILE", "ACCELERATE_CONFIG",
         "RESUME_FROM_CHECKPOINT", "CUDA_VISIBLE_DEVICES", "VLLM_PORT", "VLLM_HTTP_PORT", "VLLM_GPUS",
-        "VLLM_GPU", "QRM_GPU", "QRM_HTTP_PORT", "QRM_MODEL",
+        "VLLM_GPU", "QRM_GPU", "QRM_HTTP_PORT", "QRM_MODEL", "QRM_MAX_BATCH_TOKENS",
     ):
         env.pop(name, None)
     env.update(
@@ -55,6 +55,7 @@ def launch_env(tmp_path):
         QRM_STARTUP_TIMEOUT="5",
         QRM_REQUEST_TIMEOUT="30",
         QRM_MAX_LENGTH="1024",
+        QRM_MAX_BATCH_TOKENS="1024",
         REWARD_BATCH_SIZE="2",
         MERGE_AFTER_TRAINING="0",
         DRY_RUN="0",
@@ -91,14 +92,23 @@ def test_dry_run_resolves_gpu_count_batch_and_safe_strings_without_files(launch_
 
 
 def test_dry_run_resolves_four_gpu_split(launch_env, tmp_path):
-    for name in ("VLLM_GPUS", "QRM_GPU", "TRAIN_GPUS", "GRADIENT_ACCUMULATION_STEPS", "MAX_COMPLETION_LENGTH"):
+    for name in (
+        "VLLM_GPUS", "QRM_GPU", "TRAIN_GPUS", "GRADIENT_ACCUMULATION_STEPS",
+        "MAX_PROMPT_LENGTH", "MAX_COMPLETION_LENGTH", "VLLM_MAX_MODEL_LEN",
+        "QRM_MAX_LENGTH", "QRM_MAX_BATCH_TOKENS", "REWARD_BATCH_SIZE",
+    ):
         launch_env.pop(name, None)
     result = run_launcher(launch_env, "--dry-run")
     assert result.returncode == 0, result.stdout
     assert "vLLM GPUs 4 (TP=1); QRM GPU 5; training GPUs 6,7" in result.stdout
     assert "Training processes: 2; generation batch: 256" in result.stdout
     assert "num_generations: 8" in result.stdout
-    assert "max_completion_length: 1024" in result.stdout
+    assert "max_prompt_length: 2048" in result.stdout
+    assert "max_completion_length: 3072" in result.stdout
+    assert "QRM batching: max examples=4; padded-token budget=6144; max length=6144" in result.stdout
+    assert "use_cpu_object_collectives: true" in result.stdout
+    assert "trim_unused_padding: true" in result.stdout
+    assert "profile_stage_timings: true" in result.stdout
     assert not (tmp_path / "runs").exists()
 
 
@@ -124,6 +134,8 @@ def test_legacy_singular_gpu_variable_is_rejected(launch_env, tmp_path):
         ({"VLLM_GROUP_PORT": "8123"}, "distinct ports"),
         ({"VLLM_MAX_MODEL_LEN": "512"}, "must cover"),
         ({"VLLM_USE_V1": "1"}, "requires VLLM_USE_V1=0"),
+        ({"QRM_MAX_BATCH_TOKENS": "0"}, "must be a positive integer"),
+        ({"QRM_MAX_BATCH_TOKENS": "512"}, "must be at least QRM_MAX_LENGTH"),
     ],
 )
 def test_invalid_launch_plan_fails_before_writing(launch_env, tmp_path, overrides, message):
@@ -208,6 +220,8 @@ elif args[:2] == ["-m", "open_r1.reward_server"]:
     role = "qrm"
 elif args[:2] == ["-m", "accelerate.commands.launch"]:
     role = "train"
+elif args and args[0].endswith("generate/merge_lora_adapter.py"):
+    role = "merge"
 else:
     os.execv(sys.executable, [sys.executable, *args])
 from urllib.request import proxy_bypass
@@ -236,13 +250,53 @@ signal.signal(signal.SIGINT, stop)
     "TMPDIR": os.environ.get("TMPDIR"),
 }))
 print("fake " + role + " ready", flush=True)
+if role == "qrm":
+    print(
+        "qrm_score examples=2 queue_s=0.001 inference_s=0.100 batches=1 "
+        "input_tokens=20 padded_tokens=24 max_batch_examples=2 max_batch_padded_tokens=24",
+        flush=True,
+    )
+if role == "merge":
+    merged = Path(args[args.index("--output") + 1])
+    merged.mkdir(parents=True)
+    (merged / "config.json").write_text("{}")
+    (merged / "model.safetensors").write_bytes(b"fake-merged-model")
+    sys.exit(0)
 if role == "train" and os.environ.get("FAKE_TRAIN_WAIT") != "1":
-    # Deliberately leave a worker behind. The launcher's group cleanup owns it.
+    # Deliberately leave a worker behind. The launcher owns its process group.
     exit_code = int(os.environ.get("FAKE_TRAIN_EXIT", "0"))
     if exit_code == 0:
         output = Path(os.environ["OUTPUT_DIR"])
-        (output / "trainer_state.json").write_text('{"global_step": 2}')
+        timing = {"step": 2, "loss": 0.25}
+        for name, rank0, rank1 in (
+            ("rollout_total", 1.0, 1.1),
+            ("qrm_total", 0.5, 0.6),
+            ("external_sync_wait", 0.1, 1.5),
+            ("generation_score_total", 1.8, 2.0),
+            ("training_step_total", 4.0, 4.2),
+            ("policy_train_total", 2.0, 2.1),
+        ):
+            minimum, maximum = min(rank0, rank1), max(rank0, rank1)
+            timing.update({
+                "timing/" + name + "_min_s": minimum,
+                "timing/" + name + "_max_s": maximum,
+                "timing/" + name + "_rank_spread_s": maximum - minimum,
+                "timing/" + name + "_rank0_s": rank0,
+                "timing/" + name + "_rank1_s": rank1,
+            })
+        trainer_state = {
+            "global_step": 2,
+            "max_steps": 2,
+            "log_history": [
+                timing,
+                {"step": 2, "train_runtime": 8.0, "train_steps_per_second": 0.25},
+            ],
+        }
+        (output / "trainer_state.json").write_text(json.dumps(trainer_state))
+        (output / "train_results.json").write_text(json.dumps({"train_loss": 0.25}))
+        (output / "run_manifest.json").write_text(json.dumps({"package_versions": {}}))
         (output / "adapter_config.json").write_text("{}")
+        (output / "adapter_model.safetensors").write_bytes(b"fake-adapter")
     sys.exit(exit_code)
 while True:
     time.sleep(0.1)
@@ -305,12 +359,16 @@ def test_training_exit_preserves_status_and_reaps_workers(fake_runtime, train_ex
     run = Path(env["GRPO_OUTPUT_ROOT"]) / env["RUN_NAME"]
     status = (run / "RUN_STATUS").read_text()
     assert ("status=success" if train_exit == 0 else "status=failed") in status
+    report = json.loads((run / "validation_report.json").read_text())
+    assert report["status"] == ("passed" if train_exit == 0 else "failed")
+    assert report["run_status"]["status"] == ("success" if train_exit == 0 else "failed")
     training = json.loads((state / "train.json").read_text())
     assert qrm["args"][qrm["args"].index("--batch-size") + 1] == "2"
     server = json.loads((state / "server.json").read_text())
     assert qrm["args"][qrm["args"].index("--model") + 1] == env.get("QRM_MODEL", "friendshipkim/QRM-Llama3.1-8B-v2")
     assert qrm["args"][qrm["args"].index("--port") + 1] == env["QRM_HTTP_PORT"]
     assert qrm["args"][qrm["args"].index("--max-length") + 1] == env["QRM_MAX_LENGTH"]
+    assert qrm["args"][qrm["args"].index("--max-batch-tokens") + 1] == env["QRM_MAX_BATCH_TOKENS"]
     assert qrm["CUDA_VISIBLE_DEVICES"] == "3"
     assert server["CUDA_VISIBLE_DEVICES"] == "0"
     assert training["CUDA_VISIBLE_DEVICES"] == "1,2"
@@ -321,6 +379,22 @@ def test_training_exit_preserves_status_and_reaps_workers(fake_runtime, train_ex
     assert len(server["TMPDIR"]) <= 60
     assert_workers_stopped(state)
     assert not Path(server["TMPDIR"]).exists()
+
+
+def test_merge_artifacts_are_in_final_validation(fake_runtime):
+    env, state = fake_runtime
+    env["MERGE_AFTER_TRAINING"] = "1"
+    result = run_launcher(env)
+    assert result.returncode == 0, result.stdout
+    run = Path(env["GRPO_OUTPUT_ROOT"]) / env["RUN_NAME"]
+    report = json.loads((run / "validation_report.json").read_text())
+    assert report["status"] == "passed"
+    assert report["run_status"]["status"] == "success"
+    assert (run / "merged_model/config.json").is_file()
+    assert (run / "merged_model/model.safetensors").is_file()
+    assert (state / "merge.json").is_file()
+    assert_workers_stopped(state)
+
 
 
 @pytest.mark.parametrize("explicit_http_port", [None, "8125"])

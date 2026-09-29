@@ -1,12 +1,12 @@
 .DEFAULT_GOAL := help
-.PHONY: help doctor doctor-cuda env-create download-models cache smoke train dry-run logs plot-training install style quality test slow_test evaluate
+.PHONY: help doctor doctor-cuda env-create download-models cache smoke train dry-run logs plot-training validate-run install style quality test slow_test evaluate
 
 PYTHON ?= python
 GRPO := $(PYTHON) scripts/grpo.py
 
 help:
 	@$(GRPO) --help
-	@echo 'Make shortcuts: env-create install doctor doctor-cuda download-models cache smoke train dry-run logs plot-training test'
+	@echo 'Make shortcuts: env-create install doctor doctor-cuda download-models cache smoke train dry-run logs validate-run plot-training test'
 	@echo 'Default GPUs: VLLM_GPUS=4, QRM_GPU=5, TRAIN_GPUS=6,7; set DATASET_NAME before launch.'
 
 doctor:
@@ -35,6 +35,9 @@ dry-run:
 
 logs:
 	$(GRPO) logs --follow
+
+validate-run:
+	$(GRPO) validate $(if $(RUN_DIR),--run-dir $(RUN_DIR),) $(if $(REQUIRE_MERGED),--require-merged,)
 
 plot-training:
 	$(PYTHON) scripts/plot_training_metrics.py $(if $(RUN_DIR),$(RUN_DIR),)

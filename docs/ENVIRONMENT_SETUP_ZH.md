@@ -4,6 +4,53 @@
 
 当前状态：2026-09-24 的 1+4 卡验收属于旧布局的历史证据；新的 1+1+2 四卡拆分已完成静态与 CPU 模拟测试，仍应先运行两步真实 GPU smoke，再开始正式训练。`studentization`、`bnpo` 和自定义 trainer 仍是实验 baseline，不能直接宣称为论文原始 GRPO 的严格复现。历史记录见 [旧五卡实验说明](../EXPERIMENT_GRPO_5GPU.md)，当前排查方法见 [部署问题复盘](DEPLOYMENT_TROUBLESHOOTING_ZH.md)。
 
+## 0. 新机器最短成功路径
+
+下面是已经安装 Conda、拥有可用 NVIDIA 驱动和物理 GPU 4–7 时的完整顺序。缓存目录请改到本机空间充足的可写磁盘；数据集必须具有 `train`、`val` split 和 `prompt` 列。任一步非零退出都先停止并处理，不要跳到正式训练。
+
+```bash
+# 1) 取得固定代码；正式实验建议 checkout 你要记录的 commit。
+git clone https://github.com/BaoJun-UCAS/GRPO_Ranking_or_Reward.git
+cd GRPO_Ranking_or_Reward
+git rev-parse HEAD
+
+# 2) 把临时文件、pip/HF/编译缓存和结果统一放到大盘。
+export GRPO_WORK_DIR="$HOME/grpo-work"
+mkdir -p "$GRPO_WORK_DIR/tmp" "$GRPO_WORK_DIR/cache/pip" "$GRPO_WORK_DIR/runs"
+export TMPDIR="$GRPO_WORK_DIR/tmp"
+export PIP_CACHE_DIR="$GRPO_WORK_DIR/cache/pip"
+export GRPO_CACHE_ROOT="$GRPO_WORK_DIR/cache/grpo"
+export HF_HOME="$GRPO_CACHE_ROOT/huggingface"
+export GRPO_OUTPUT_ROOT="$GRPO_WORK_DIR/runs"
+
+# 3) 创建固定版本环境并单独编译 FlashAttention。
+conda env create -f environment.yml
+conda activate grpo
+export CUDA_HOME="$CONDA_PREFIX"
+MAX_JOBS=8 python -m pip install flash-attn==2.7.4.post1 --no-build-isolation
+python -m pip check
+python scripts/grpo.py doctor
+
+# 4) 配置数据和四张物理卡；不要在 launcher 外再套 CUDA_VISIBLE_DEVICES。
+export DATASET_NAME=你的组织或用户名/UltraChat-200k
+export VLLM_GPUS=4
+export QRM_GPU=5
+export TRAIN_GPUS=6,7
+
+# 5) 下载、静态预检和真实两步验收。
+python scripts/grpo.py download
+python scripts/grpo.py smoke --dry-run
+CUDA_VISIBLE_DEVICES=4,5,6,7 python scripts/grpo.py doctor --cuda
+python scripts/grpo.py smoke
+python scripts/grpo.py validate
+
+# 6) smoke 的 validation_report.json 为 passed 后才启动正式实验。
+python scripts/grpo.py train
+python scripts/grpo.py validate --require-merged
+```
+
+本项目按当前要求固定使用物理 GPU 4–7，不使用 0–3；不要在外层通过 `CUDA_VISIBLE_DEVICES` 把它们重新编号。将来迁移到编号不同的调度环境时，必须先取得四张明确分配的卡，再同时修改三个角色变量并重新完成 smoke。更完整的系统检查、Miniconda 安装、数据上传、端口、恢复和故障处理见下文。
+
 ## 1. 检查账户与系统
 
 ```bash
@@ -130,7 +177,7 @@ watch -n 5 'python scripts/grpo.py cache'
 
 缓存体积和 `.incomplete` 文件能提示是否有下载活动，但不等于精确百分比；使用 Xet 等下载方式时，中间缓存可能位于其他子目录。显式下载命令的进度和成功退出才是更可靠的信号。缓存下载完成也不代表模型已经加载到 GPU。
 
-QRM 奖励模型由 `open_r1.reward_server` 在物理 GPU 5 单独加载；策略训练进程不会再复制 8B QRM。训练 rank 会把待评分样本聚合到主 rank，由主 rank 发出一次 HTTP 请求，再广播并切分奖励结果。
+QRM 奖励模型由 `open_r1.reward_server` 在物理 GPU 5 单独加载；策略训练进程不会再复制 8B QRM。训练 rank 会把待评分样本聚合到主 rank，由主 rank 发出一次 HTTP 请求，再广播并切分奖励结果。QRM 会先按 token 长度排序，再同时受 `REWARD_BATCH_SIZE`（默认 4）与 `QRM_MAX_BATCH_TOKENS`（默认 6144 个 padding 后 token）约束进行动态分批，最后恢复原顺序。`qrm_server.log` 的 `qrm_score` 行会记录 queue、inference、batch 数、原始 token、padding 后 token、单批最大样本数和单批最大 padded token，便于判断是服务推理慢还是 padding 浪费。`QRM_MAX_BATCH_TOKENS` 必须不小于 `QRM_MAX_LENGTH`，否则任意一个达到最大长度的样本就无法满足硬预算，启动器会在占用 GPU 前拒绝该配置。
 
 ## 6. 准备数据集
 
@@ -191,9 +238,23 @@ VLLM_GROUP_PORT=51226 python scripts/grpo.py train
 训练卡数 × PER_DEVICE_TRAIN_BATCH_SIZE × GRADIENT_ACCUMULATION_STEPS
 ```
 
-如果显式设置 `GENERATION_BATCH_SIZE`，它必须满足上述约束且能被 `NUM_GENERATIONS` 整除。smoke 默认两步、梯度累积 8、prompt 上限 512、completion 上限 256、QRM batch 1，并跳过合并；它验证流水线，不用于报告收敛结果。数据映射阶段会在保留聊天结构的前提下左截断最后一条用户内容，因此策略训练、vLLM rollout 和 QRM 共享同一结构化 prompt。快捷命令尊重显式环境变量，运行前注意清除旧覆盖。
+如果显式设置 `GENERATION_BATCH_SIZE`，它必须满足上述约束且能被 `NUM_GENERATIONS` 整除。smoke 默认两步、梯度累积 8、prompt 上限 2048、completion 上限 3072、QRM batch 上限 4、QRM padded-token budget 6144，并跳过合并；它验证流水线，不用于报告收敛结果。数据映射阶段会在保留聊天结构的前提下左截断最后一条用户内容，因此策略训练、vLLM rollout 和 QRM 共享同一结构化 prompt。快捷命令尊重显式环境变量，运行前注意清除旧覆盖。
 
-两步验收需要同时满足：服务 health 成功；生成和训练侧权重同步无错误；完成两个 optimizer step；adapter 保存成功；`RUN_STATUS` 为 success。要连同合并验收，执行 `MERGE_AFTER_TRAINING=1 python scripts/grpo.py smoke` 并确认合并产物可加载。正式 `train` 默认开启合并。只看到权重下载或 `/health/` 返回 200 都不等于训练成功。
+四卡 recipe 默认开启三项兼容性优化：`use_cpu_object_collectives` 用独立 Gloo 组承载 prompt/completion 等 Python 对象通信，避免外部服务等待期间 NCCL kernel 伪装成 GPU7 的有效计算；`trim_unused_padding` 在 generation batch 拆成 policy micro-batch 后删除全 padding 列；`profile_stage_timings` 记录 rollout、QRM、等待和 policy step 的各 rank/min/max/spread wall time。梯度、reward tensor 和参数同步仍走原分布式后端，reward 与 loss 语义不变。Gloo 不可用时会告警并退回旧路径；建立稳定基线后如需消除计时本身的少量开销，可在自定义 recipe 中关闭 `profile_stage_timings`。
+
+训练日志中优先比较 `timing/rollout_total_max_s`、`timing/qrm_total_max_s`、`timing/policy_train_total_max_s` 和 `timing/*_rank_spread_s`。非主 rank 的 `timing/external_sync_wait_rank1_s` 包含等待 rank0 完成服务调用的时间，因此比单看 `nvidia-smi` 的 GPU Util 更接近同步瓶颈。这里仍是同步 rollout → reward → train，不会为了表面利用率自动启用可能引入 stale-policy 的异步采样。
+
+两步验收需要同时满足：服务 health 成功；生成和训练侧权重同步无错误；完成两个 optimizer step；adapter 保存成功；`RUN_STATUS` 为 success。启动器会在写 success 前自动运行 CPU-only 验收，检查步数、有限 loss、计时字段及 rank 一致性、QRM batch/token 上限、adapter/模型文件和关键日志，并写出 `validation_report.json`；验收失败会让整个 run 失败，而不是保留一个表面成功状态。可随时复查：
+
+```bash
+python scripts/grpo.py validate --run-dir /path/to/run
+# 正式训练要求已经合并 LoRA 时：
+python scripts/grpo.py validate --run-dir /path/to/run --require-merged
+# 等价 Makefile 入口：
+make validate-run RUN_DIR=/path/to/run REQUIRE_MERGED=1
+```
+
+要连同合并验收，执行 `MERGE_AFTER_TRAINING=1 python scripts/grpo.py smoke` 并确认合并产物可加载。正式 `train` 默认开启合并。只看到权重下载或 `/health/` 返回 200 都不等于训练成功；产物验收也不等同于模型质量评测或真实 GPU kernel 正确性验证。
 
 当前四卡 recipe 使用两进程 ZeRO-2；LoRA 下可通过禁用 adapter 复用基础策略作为 reference，避免 ZeRO-3 路径额外复制 reference model。recipe 仍保留重入式 gradient checkpoint。旧 ZeRO-3 配置的非重入 checkpoint 故障属于历史兼容边界，详见故障复盘。
 

@@ -22,15 +22,16 @@ Set environment variables before invoking this script:
   QRM_MODEL=friendshipkim/QRM-Llama3.1-8B-v2
   PER_DEVICE_TRAIN_BATCH_SIZE=1 NUM_GENERATIONS=8
   QRM_REVISION=main             Pin a commit hash for formal runs
-  GRADIENT_ACCUMULATION_STEPS=128 MAX_STEPS=500
+  GRADIENT_ACCUMULATION_STEPS=128 MAX_STEPS=800
   GENERATION_BATCH_SIZE         Defaults to training GPU count × per-device
                                batch × gradient accumulation; must match it
-  MAX_PROMPT_LENGTH=1024 MAX_COMPLETION_LENGTH=1024 REWARD_BATCH_SIZE=1
+  MAX_PROMPT_LENGTH=2048 MAX_COMPLETION_LENGTH=3072 REWARD_BATCH_SIZE=4
   VLLM_HTTP_PORT=8000 QRM_HTTP_PORT=8001 PORT=29501 VLLM_GROUP_PORT=51216
                                Distinct service/training/weight-sync ports
-  QRM_MAX_LENGTH=4096 QRM_REQUEST_TIMEOUT=900 QRM_STARTUP_TIMEOUT=1200
+  QRM_MAX_LENGTH=6144 QRM_MAX_BATCH_TOKENS=6144
+  QRM_REQUEST_TIMEOUT=900 QRM_STARTUP_TIMEOUT=1200
   VLLM_PORT                    Deprecated HTTP alias; prefer VLLM_HTTP_PORT
-  VLLM_MAX_MODEL_LEN=4096 VLLM_GPU_MEMORY_UTILIZATION=0.82
+  VLLM_MAX_MODEL_LEN=6144 VLLM_GPU_MEMORY_UTILIZATION=0.82
   VLLM_STARTUP_TIMEOUT=600      Total server startup deadline, seconds
   SERVICE_SHUTDOWN_GRACE_SECONDS=15 Graceful shutdown before SIGKILL
   GRPO_OUTPUT_ROOT              Defaults to <repository>/grpo_runs
@@ -100,7 +101,8 @@ QRM_STARTUP_TIMEOUT="${QRM_STARTUP_TIMEOUT:-1200}"
 QRM_REQUEST_TIMEOUT="${QRM_REQUEST_TIMEOUT:-900}"
 SERVICE_SHUTDOWN_GRACE_SECONDS="${SERVICE_SHUTDOWN_GRACE_SECONDS:-15}"
 QRM_MAX_LENGTH="${QRM_MAX_LENGTH:-6144}"
-REWARD_BATCH_SIZE="${REWARD_BATCH_SIZE:-1}"
+REWARD_BATCH_SIZE="${REWARD_BATCH_SIZE:-4}"
+QRM_MAX_BATCH_TOKENS="${QRM_MAX_BATCH_TOKENS:-${QRM_MAX_LENGTH}}"
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-2048}"
 MAX_COMPLETION_LENGTH="${MAX_COMPLETION_LENGTH:-3072}"
 PER_DEVICE_TRAIN_BATCH_SIZE="${PER_DEVICE_TRAIN_BATCH_SIZE:-1}"
@@ -119,7 +121,7 @@ if [[ -z "${DATASET_NAME:-}" ]]; then
 fi
 
 for numeric_name in VLLM_STARTUP_TIMEOUT QRM_STARTUP_TIMEOUT QRM_REQUEST_TIMEOUT QRM_MAX_LENGTH \
-    REWARD_BATCH_SIZE MAX_PROMPT_LENGTH QRM_HTTP_PORT \
+    QRM_MAX_BATCH_TOKENS REWARD_BATCH_SIZE MAX_PROMPT_LENGTH QRM_HTTP_PORT \
     MAX_COMPLETION_LENGTH PER_DEVICE_TRAIN_BATCH_SIZE NUM_GENERATIONS \
     GRADIENT_ACCUMULATION_STEPS MAX_STEPS VLLM_MAX_MODEL_LEN VLLM_HTTP_PORT PORT VLLM_GROUP_PORT; do
     if [[ ! "${!numeric_name}" =~ ^[1-9][0-9]*$ ]]; then
@@ -165,7 +167,8 @@ export TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-${GRPO_CACHE_ROOT}/torch_ex
 export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-${GRPO_CACHE_ROOT}/triton}"
 export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-${GRPO_CACHE_ROOT}/vllm}"
 export RUN_NAME RUN_TOKEN OUTPUT_DIR DATASET_NAME MODEL_NAME QRM_MODEL QRM_REVISION VLLM_HTTP_PORT VLLM_GROUP_PORT QRM_HTTP_PORT
-export QRM_GPU QRM_REQUEST_TIMEOUT QRM_MAX_LENGTH SERVICE_SHUTDOWN_GRACE_SECONDS REWARD_BATCH_SIZE
+export QRM_GPU QRM_REQUEST_TIMEOUT QRM_MAX_LENGTH QRM_MAX_BATCH_TOKENS
+export SERVICE_SHUTDOWN_GRACE_SECONDS REWARD_BATCH_SIZE
 export MAX_PROMPT_LENGTH MAX_COMPLETION_LENGTH GENERATION_BATCH_SIZE
 export GRADIENT_ACCUMULATION_STEPS MAX_STEPS NUM_GENERATIONS PER_DEVICE_TRAIN_BATCH_SIZE
 export TRAIN_GPUS VLLM_GPUS NUM_VLLM_GPUS NUM_TRAIN_GPUS VLLM_MAX_MODEL_LEN VLLM_GPU_MEMORY_UTILIZATION PORT
@@ -188,6 +191,7 @@ export VLLM_USE_V1="${VLLM_USE_V1:-0}"
 export VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}"
 
 HELPER="${SCRIPT_DIR}/run_helpers.py"
+VALIDATOR="${PROJECT_ROOT}/scripts/validate_training_run.py"
 "${PYTHON}" "${HELPER}" resolve --config "${CONFIG_FILE}" --accelerate-config "${ACCELERATE_CONFIG}"
 if [[ "${DRY_RUN}" == 1 ]]; then
     echo 'Dry run complete. No run directory was created and no GPU was used.'
@@ -247,6 +251,9 @@ record_exit() {
         printf 'finished_utc=%s\nstatus=success\n' "$(date -u +%Y%m%dT%H%M%SZ)" > "${OUTPUT_DIR}/RUN_STATUS"
     else
         printf 'finished_utc=%s\nstatus=failed\nexit_code=%s\n' "$(date -u +%Y%m%dT%H%M%SZ)" "${exit_code}" > "${OUTPUT_DIR}/RUN_STATUS"
+        if [[ -f "${VALIDATOR}" ]]; then
+            "${PYTHON}" "${VALIDATOR}" "${OUTPUT_DIR}" >> "${OUTPUT_DIR}/logs/validation.log" 2>&1 || true
+        fi
     fi
     exit "${exit_code}"
 }
@@ -281,7 +288,8 @@ fi
     for key in RUN_NAME RUN_TOKEN OUTPUT_DIR MODEL_NAME QRM_MODEL QRM_REVISION DATASET_NAME VLLM_GPUS QRM_GPU TRAIN_GPUS CUDA_DEVICE_ORDER \
         NUM_VLLM_GPUS NUM_TRAIN_GPUS VLLM_HTTP_PORT QRM_HTTP_PORT PORT VLLM_GROUP_PORT \
         VLLM_MAX_MODEL_LEN VLLM_GPU_MEMORY_UTILIZATION VLLM_STARTUP_TIMEOUT \
-        QRM_MAX_LENGTH REWARD_BATCH_SIZE QRM_REQUEST_TIMEOUT QRM_STARTUP_TIMEOUT SERVICE_SHUTDOWN_GRACE_SECONDS \
+        QRM_MAX_LENGTH QRM_MAX_BATCH_TOKENS REWARD_BATCH_SIZE QRM_REQUEST_TIMEOUT QRM_STARTUP_TIMEOUT \
+        SERVICE_SHUTDOWN_GRACE_SECONDS \
         MAX_PROMPT_LENGTH MAX_COMPLETION_LENGTH VLLM_USE_V1 VLLM_WORKER_MULTIPROC_METHOD \
         GRPO_CACHE_ROOT HF_HOME HF_HUB_CACHE TORCH_EXTENSIONS_DIR TRITON_CACHE_DIR VLLM_CACHE_ROOT VLLM_TMPDIR \
         WANDB_MODE MAX_STEPS GENERATION_BATCH_SIZE RESUME_FROM_CHECKPOINT \
@@ -313,7 +321,8 @@ QRM_LOG="${OUTPUT_DIR}/logs/qrm_server.log"
 echo "Starting QRM on physical GPU ${QRM_GPU}; log: ${QRM_LOG}"
 setsid env CUDA_VISIBLE_DEVICES="${QRM_GPU}" "${PYTHON}" -m open_r1.reward_server \
     --model "${QRM_MODEL}" --revision "${QRM_REVISION}" --host 127.0.0.1 --port "${QRM_HTTP_PORT}" \
-    --batch-size "${REWARD_BATCH_SIZE}" --max-length "${QRM_MAX_LENGTH}" --run-id "${RUN_TOKEN}" \
+    --batch-size "${REWARD_BATCH_SIZE}" --max-batch-tokens "${QRM_MAX_BATCH_TOKENS}" \
+    --max-length "${QRM_MAX_LENGTH}" --run-id "${RUN_TOKEN}" \
     --dtype bfloat16 > "${QRM_LOG}" 2>&1 &
 QRM_PID=$!
 
@@ -393,10 +402,9 @@ run_logged "${OUTPUT_DIR}/logs/training.log" \
     --config_file "${RESOLVED_ACCELERATE_CONFIG}" --main_process_port "${PORT}" \
     --num_processes "${NUM_TRAIN_GPUS}" src/open_r1/grpo.py --config "${PROCESSED_CONFIG}"
 
-if [[ ! -s "${OUTPUT_DIR}/trainer_state.json" || ! -s "${OUTPUT_DIR}/adapter_config.json" ]]; then
-    echo "Training exited successfully but required final artifacts are missing: trainer_state.json / adapter_config.json" >&2
-    exit 1
-fi
+echo "Validating training artifacts and pipeline timings"
+"${PYTHON}" "${VALIDATOR}" "${OUTPUT_DIR}" --allow-running 2>&1 \
+    | tee "${OUTPUT_DIR}/logs/validation.log"
 
 terminate_group "${VLLM_PID}"
 VLLM_PID=""
@@ -408,4 +416,13 @@ if [[ "${MERGE_AFTER_TRAINING}" == 1 ]]; then
         env CUDA_VISIBLE_DEVICES="${MERGE_GPU}" "${PYTHON}" generate/merge_lora_adapter.py \
         --adapter "${OUTPUT_DIR}" --output "${OUTPUT_DIR}/merged_model"
 fi
+FINAL_VALIDATION_ARGS=()
+if [[ "${MERGE_AFTER_TRAINING}" == 1 ]]; then
+    FINAL_VALIDATION_ARGS+=(--require-merged)
+    "${PYTHON}" "${VALIDATOR}" "${OUTPUT_DIR}" --allow-running "${FINAL_VALIDATION_ARGS[@]}" 2>&1 \
+        | tee -a "${OUTPUT_DIR}/logs/validation.log"
+fi
+printf 'finished_utc=%s\nstatus=success\n' "$(date -u +%Y%m%dT%H%M%SZ)" > "${OUTPUT_DIR}/RUN_STATUS"
+"${PYTHON}" "${VALIDATOR}" "${OUTPUT_DIR}" "${FINAL_VALIDATION_ARGS[@]}" 2>&1 \
+    | tee -a "${OUTPUT_DIR}/logs/validation.log"
 echo "Run complete: ${OUTPUT_DIR}"

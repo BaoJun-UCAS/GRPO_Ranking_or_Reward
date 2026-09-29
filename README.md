@@ -80,6 +80,7 @@ All shortcuts use the active Python environment and work without `make` via
 | Run two optimizer steps | `make smoke` | Starts QRM, vLLM, and training |
 | Run the configured experiment | `make train` | Starts QRM, vLLM, and training |
 | Follow the latest service/training log | `make logs` | None |
+| Validate final artifacts and timing evidence | `make validate-run RUN_DIR=/path/to/run` | None |
 | Plot training metrics | `make plot-training RUN_DIR=/path/to/run` | None |
 | Run lightweight tests | `make test` | None |
 
@@ -146,6 +147,23 @@ health endpoint for each service before starting two-process ZeRO-2 training on
 GPUs 6–7. The vLLM service preserves the TRL 0.18 weight-synchronization
 protocol; a generic OpenAI-compatible endpoint is not sufficient.
 
+The four-GPU recipe keeps Python-object gather/broadcast traffic on an optional
+CPU/Gloo control group, while tensor gradients and reward tensors continue to
+use the normal distributed backend. This prevents a policy rank waiting for
+vLLM or QRM from appearing GPU-busy solely because an NCCL object collective is
+spinning. If Gloo is unavailable, the trainer warns and falls back to the legacy
+collective path.
+
+The QRM server sorts requests by tokenized length and forms batches bounded by
+both `REWARD_BATCH_SIZE` and `QRM_MAX_BATCH_TOKENS`; results are restored to
+their original order. Policy micro-batches also discard prompt/completion
+columns that are padding for every sample in that micro-batch. Stage timing is
+enabled in this recipe: `timing/rollout_total_*`, `timing/qrm_total_*`,
+`timing/external_sync_wait_*`, and `timing/policy_train_total_*` expose per-rank,
+minimum, maximum, and rank-spread wall times in the normal Trainer logs. The
+`*_total_*` policy metrics sum all accumulation micro-steps in one optimizer
+step; the accompanying `*_mean_*` metrics retain the per-micro-step average.
+
 ### Running Training
 
 ```shell
@@ -170,8 +188,8 @@ bash train_scripts/qwen3_1.7_grpo_ranking_chat.sh
 | `GRPO_CACHE_ROOT`, `GRPO_DATA_ROOT`, `HF_HOME`, `HF_HUB_CACHE` | Cache location; explicit paths win, otherwise a writable `/data/<user>/cache/grpo` is preferred before the home-directory fallback |
 | `VLLM_TMPDIR` | Optional short vLLM IPC directory; the launcher otherwise creates and cleans `/tmp/grpo-vllm.*` |
 | `NUM_GENERATIONS`, `PER_DEVICE_TRAIN_BATCH_SIZE`, `GRADIENT_ACCUMULATION_STEPS` | Batch configuration; generation batch is derived unless explicitly supplied |
-| `MAX_STEPS`, `MAX_PROMPT_LENGTH`, `MAX_COMPLETION_LENGTH`, `REWARD_BATCH_SIZE` | Training scale and memory controls; QRM defaults to batch 1 |
-| `QRM_MAX_LENGTH`, `QRM_REQUEST_TIMEOUT`, `QRM_STARTUP_TIMEOUT` | Reward-server context and bounded request/startup waits |
+| `MAX_STEPS`, `MAX_PROMPT_LENGTH`, `MAX_COMPLETION_LENGTH`, `REWARD_BATCH_SIZE` | Training scale and memory controls; QRM accepts at most 4 examples per dynamic batch by default |
+| `QRM_MAX_LENGTH`, `QRM_MAX_BATCH_TOKENS`, `QRM_REQUEST_TIMEOUT`, `QRM_STARTUP_TIMEOUT` | Reward context, padded-token budget (default 6144), and bounded request/startup waits |
 | `VLLM_HTTP_PORT`, `QRM_HTTP_PORT`, `PORT`, `VLLM_GROUP_PORT` | vLLM HTTP, QRM HTTP, training rendezvous, and weight-sync ports; all four must be distinct |
 
 The default output root is `grpo_runs/` inside the repository. Without explicit
@@ -183,7 +201,12 @@ directory. W&B defaults to offline mode; set `WANDB_MODE=online` to upload
 metrics. No `.env` file is loaded implicitly.
 
 The smoke shortcut defaults to two steps and skips LoRA merging; use
-`MERGE_AFTER_TRAINING=1 python scripts/grpo.py smoke` to include it. Explicit
+`MERGE_AFTER_TRAINING=1 python scripts/grpo.py smoke` to include it. Successful
+launcher runs are accepted by the CPU-only artifact/timing validator before they
+are marked successful. Re-run the same checks with
+`python scripts/grpo.py validate --run-dir /path/to/run`; add
+`--require-merged` when a merged model is part of the contract. The structured
+result is written to `validation_report.json`. Explicit
 environment overrides are respected, so clear stale training values before a
 smoke run. To resume while preserving the original run's evidence:
 

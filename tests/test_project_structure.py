@@ -36,6 +36,7 @@ def test_required_project_files_exist():
         "recipes/Qwen3-1.7B/config_chat_regular_qrm_lora_5gpu.yaml",
         "recipes/Qwen3-1.7B/config_chat_regular_qrm_lora_4gpu_split.yaml",
         "train_scripts/qwen3_1.7_grpo_chat.sh",
+        "scripts/validate_training_run.py",
         "train_scripts/qwen3_1.7_grpo_ranking_chat.sh",
         "src/open_r1/vllm_serve.py",
         "evaluate/run_grpo_chat_deepseek.sh",

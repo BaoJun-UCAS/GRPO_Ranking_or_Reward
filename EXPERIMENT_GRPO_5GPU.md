@@ -3,6 +3,13 @@
 > 本文保留历史 1+4 卡、本地 QRM/ZeRO-3 验收记录。当前默认已改为
 > GPU 4=vLLM、GPU 5=独立 QRM、GPU 6–7=ZeRO-2 训练；以部署指南为准。
 
+> 2026-09-28 的四卡效率调整保持同步 rollout → reward → policy train
+> 语义：Python 对象 gather/broadcast 优先使用 CPU/Gloo；QRM 使用长度感知、
+> token-budget 约束的动态 batch；policy micro-batch 删除全 padding 列，并输出
+> 各阶段/各 rank wall-time。它用于减少无效计算并辨别 NCCL 等待，不把异步
+> rollout 或 stale-policy 更新混入当前 baseline。该新布局尚需完整 GPU smoke
+> 和长跑对比，不能沿用 2026-09-24 旧 1+4 卡验收结论。
+
 ## 实验目标与当前状态
 
 首轮目标是在 UltraChat 上完成 `studentization` 优势计算的实验 baseline，再在相同条件下研究 ranking 等方法。策略模型为 `Qwen/Qwen3-1.7B`，奖励模型为 `friendshipkim/QRM-Llama3.1-8B-v2`，策略模型采用 BF16 LoRA，训练采用 DeepSpeed ZeRO-3。

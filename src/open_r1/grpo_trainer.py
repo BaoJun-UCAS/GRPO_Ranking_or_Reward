@@ -14,6 +14,7 @@
 
 import os
 import textwrap
+import time
 import warnings
 from collections import defaultdict, deque
 from collections.abc import Sized
@@ -223,6 +224,42 @@ def split_tensor_dict(
         }
         for i in range(num_chunks)
     ]
+
+
+def trim_padded_microbatch(
+    inputs: dict[str, Optional[torch.Tensor]],
+) -> dict[str, Optional[torch.Tensor]]:
+    """Drop columns that are padding for every sample in one policy micro-batch."""
+
+    trimmed = dict(inputs)
+    prompt_lengths = inputs.get("_prompt_lengths")
+    completion_lengths = inputs.get("_completion_lengths")
+    if prompt_lengths is not None:
+        prompt_width = max(1, int(prompt_lengths.max().item()))
+        for key in ("prompt_ids", "prompt_mask"):
+            if inputs.get(key) is not None:
+                trimmed[key] = inputs[key][:, -prompt_width:]
+    if completion_lengths is not None:
+        completion_width = max(1, int(completion_lengths.max().item()))
+        for key in ("completion_ids", "completion_mask", "old_per_token_logps"):
+            if inputs.get(key) is not None:
+                trimmed[key] = inputs[key][:, :completion_width]
+    trimmed.pop("_prompt_lengths", None)
+    trimmed.pop("_completion_lengths", None)
+    return trimmed
+
+
+def summarize_timing_samples(samples: dict[str, list[float]]) -> dict[str, float]:
+    """Summarize local micro-step wall times once per optimizer step."""
+
+    counts = {len(values) for values in samples.values()}
+    if not samples or counts == {0} or len(counts) != 1:
+        raise ValueError("Timing samples must contain equally sized, non-empty series")
+    summary = {}
+    for name, values in samples.items():
+        summary[f"{name}_total"] = sum(values)
+        summary[f"{name}_mean"] = sum(values) / len(values)
+    return summary
 
 
 def shuffle_tensor_dict(tensor_dict: dict[str, Optional[torch.Tensor]]) -> dict[str, Optional[torch.Tensor]]:
@@ -512,6 +549,9 @@ class GRPOTrainer(Trainer):
         self.loss_type = args.loss_type
         self.scale_rewards = args.scale_rewards
         self.mask_truncated_completions = args.mask_truncated_completions
+        self.use_cpu_object_collectives = args.use_cpu_object_collectives
+        self.trim_unused_padding = args.trim_unused_padding
+        self.profile_stage_timings = args.profile_stage_timings
 
         # Datasets
         self.shuffle_dataset = args.shuffle_dataset
@@ -560,6 +600,24 @@ class GRPOTrainer(Trainer):
             optimizers=optimizers,
         )
 
+        # Python-object collectives otherwise use the NCCL process group and can
+        # make an idle rank look GPU-busy while rank 0 waits for an HTTP service.
+        # Keep the legacy path as a fallback for builds without Gloo.
+        self._object_collective_group = None
+        if self.use_cpu_object_collectives and self.accelerator.num_processes > 1:
+            gloo_available = (
+                torch.distributed.is_available()
+                and torch.distributed.is_initialized()
+                and torch.distributed.is_gloo_available()
+            )
+            if gloo_available:
+                try:
+                    self._object_collective_group = torch.distributed.new_group(backend="gloo")
+                except RuntimeError as error:
+                    warnings.warn(f"Could not create the Gloo control group; falling back to NCCL objects: {error}")
+            else:
+                warnings.warn("Gloo object collectives requested but unavailable; falling back to the default backend")
+
         # Reference model
         self.beta = args.beta
         if self.beta == 0.0:
@@ -602,6 +660,8 @@ class GRPOTrainer(Trainer):
 
         # Initialize the metrics
         self._metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
+        self._pending_policy_timings = defaultdict(list)
+        self._last_prepare_wall_seconds = 0.0
         self._total_train_tokens = 0
         self.log_completions = args.log_completions
         self.num_completions_to_print = args.num_completions_to_print
@@ -1063,6 +1123,44 @@ class GRPOTrainer(Trainer):
         elif self.vllm_mode == "colocate":
             self.llm.reset_prefix_cache()
 
+    def _gather_python_objects(self, objects: list[Any]) -> list[Any]:
+        if self._object_collective_group is None:
+            return gather_object(objects)
+        gathered = [None for _ in range(self.accelerator.num_processes)]
+        torch.distributed.all_gather_object(gathered, objects, group=self._object_collective_group)
+        return [item for rank_items in gathered for item in rank_items]
+
+    def _broadcast_python_objects(self, objects: list[Any], from_process: int = 0) -> list[Any]:
+        if self._object_collective_group is None:
+            return broadcast_object_list(objects, from_process=from_process)
+        torch.distributed.broadcast_object_list(
+            objects,
+            src=from_process,
+            group=self._object_collective_group,
+            device=torch.device("cpu"),
+        )
+        return objects
+
+    def _record_phase_timings(self, mode: str, timings: dict[str, float]) -> None:
+        if not self.profile_stage_timings:
+            return
+        names = tuple(timings)
+        values = [timings[name] for name in names]
+        if self._object_collective_group is not None:
+            gathered = [None for _ in range(self.accelerator.num_processes)]
+            torch.distributed.all_gather_object(gathered, values, group=self._object_collective_group)
+            all_ranks = torch.tensor(gathered, dtype=torch.float32)
+        else:
+            local = torch.tensor([values], device=self.accelerator.device, dtype=torch.float32)
+            all_ranks = self.accelerator.gather(local).reshape(-1, len(names)).cpu()
+        for column, name in enumerate(names):
+            values = all_ranks[:, column]
+            self._metrics[mode][f"timing/{name}_max_s"].append(values.max().item())
+            self._metrics[mode][f"timing/{name}_min_s"].append(values.min().item())
+            self._metrics[mode][f"timing/{name}_rank_spread_s"].append((values.max() - values.min()).item())
+            for rank, value in enumerate(values.tolist()):
+                self._metrics[mode][f"timing/{name}_rank{rank}_s"].append(value)
+
     @profiling_decorator
     def _prepare_inputs(
         self, generation_batch: dict[str, Union[torch.Tensor, Any]]
@@ -1080,6 +1178,7 @@ class GRPOTrainer(Trainer):
         #   - Completions are generated for each batch without buffering or reuse
         # Returns a single local batch in both cases.
 
+        prepare_started = time.perf_counter()
         mode = "train" if self.model.training else "eval"
         if mode == "train":
             generate_every = self.args.steps_per_generation * self.num_iterations
@@ -1088,19 +1187,55 @@ class GRPOTrainer(Trainer):
                 generation_batch = self._generate_and_score_completions(generation_batch)
                 generation_batch = shuffle_tensor_dict(generation_batch)
                 self._buffered_inputs = split_tensor_dict(generation_batch, self.args.steps_per_generation)
-            inputs = self._buffered_inputs[self._step % self.args.steps_per_generation]
+            buffer_index = self._step % self.args.steps_per_generation
+            inputs = self._buffered_inputs[buffer_index]
+            if self.trim_unused_padding:
+                inputs = trim_padded_microbatch(inputs)
+                self._buffered_inputs[buffer_index] = inputs
             self._step += 1
         else:
             # In evaluation, there is neither batch grouping for generation, nor multiple iterations, hence
             # local generation batch == local eval batch
             inputs = self._generate_and_score_completions(generation_batch)
+            if self.trim_unused_padding:
+                inputs = trim_padded_microbatch(inputs)
+        self._last_prepare_wall_seconds = time.perf_counter() - prepare_started
         return inputs
+
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        step_started = time.perf_counter()
+        self._last_prepare_wall_seconds = 0.0
+        loss = super().training_step(model, inputs, num_items_in_batch)
+        if self.profile_stage_timings:
+            total = time.perf_counter() - step_started
+            policy = max(0.0, total - self._last_prepare_wall_seconds)
+            self._pending_policy_timings["training_step"].append(total)
+            self._pending_policy_timings["policy_train"].append(policy)
+            if self.accelerator.sync_gradients:
+                timing_summary = summarize_timing_samples(self._pending_policy_timings)
+                self._record_phase_timings("train", timing_summary)
+                self._pending_policy_timings.clear()
+        return loss
 
     def _generate_and_score_completions(
         self, inputs: list[dict[str, Union[torch.Tensor, Any]]]
     ) -> dict[str, Union[torch.Tensor, Any]]:
         device = self.accelerator.device
         mode = "train" if self.model.training else "eval"
+        generation_started = time.perf_counter()
+        phase_timings = {
+            "weight_sync": 0.0,
+            "rollout_gather": 0.0,
+            "vllm_service": 0.0,
+            "rollout_broadcast": 0.0,
+            "rollout_total": 0.0,
+            "qrm_gather": 0.0,
+            "qrm_service": 0.0,
+            "qrm_broadcast": 0.0,
+            "qrm_total": 0.0,
+            "external_sync_wait": 0.0,
+            "generation_score_total": 0.0,
+        }
 
         prompts = [x["prompt"] for x in inputs]
 
@@ -1111,28 +1246,34 @@ class GRPOTrainer(Trainer):
         prompt_inputs = self.processing_class(
             text=prompts_text, return_tensors="pt", padding=True, padding_side="left", add_special_tokens=False
         )
+        prompt_lengths_for_trimming = prompt_inputs["attention_mask"].sum(dim=1)
         prompt_inputs = super()._prepare_inputs(prompt_inputs)
         prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
 
         if self.max_prompt_length is not None:
             prompt_ids = prompt_ids[:, -self.max_prompt_length :]
             prompt_mask = prompt_mask[:, -self.max_prompt_length :]
+            prompt_lengths_for_trimming = prompt_lengths_for_trimming.clamp(max=self.max_prompt_length)
 
         # Generate completions using either vLLM or regular generation
         if self.use_vllm:
             # First, update the vLLM weights if needed
             if self.state.global_step != self._last_loaded_step:
+                weight_sync_started = time.perf_counter()
                 self._move_model_to_vllm()
+                phase_timings["weight_sync"] = time.perf_counter() - weight_sync_started
                 self._last_loaded_step = self.state.global_step
 
             # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
             if self.vllm_mode == "server":
-                all_prompts_text = gather_object(prompts_text)
+                rollout_started = time.perf_counter()
+                gather_started = time.perf_counter()
+                all_prompts_text = self._gather_python_objects(prompts_text)
+                phase_timings["rollout_gather"] = time.perf_counter() - gather_started
                 if self.accelerator.is_main_process:
-                    # Since 'prompts' contains 'num_generations' duplicates, we first take unique prompts, and generate
-                    # num_generations outputs for each one. This is faster than generating outputs for each duplicate
-                    # prompt individually.
+                    # Since prompts contain num_generations duplicates, generate once per unique prompt.
                     ordered_set_of_prompts = all_prompts_text[:: self.num_generations]
+                    service_started = time.perf_counter()
                     with profiling_context(self, "vLLM.generate"):
                         completion_ids = self.vllm_client.generate(
                             prompts=ordered_set_of_prompts,
@@ -1145,16 +1286,19 @@ class GRPOTrainer(Trainer):
                             max_tokens=self.max_completion_length,
                             guided_decoding_regex=self.guided_decoding_regex,
                         )
+                    phase_timings["vllm_service"] = time.perf_counter() - service_started
                 else:
                     completion_ids = [None] * len(all_prompts_text)
-                # Broadcast the completions from the main process to all processes, ensuring each process receives its
-                # corresponding slice.
-                completion_ids = broadcast_object_list(completion_ids, from_process=0)
+                # With the optional Gloo group, non-main ranks wait on CPU instead of spinning an NCCL GPU kernel.
+                broadcast_started = time.perf_counter()
+                completion_ids = self._broadcast_python_objects(completion_ids, from_process=0)
+                phase_timings["rollout_broadcast"] = time.perf_counter() - broadcast_started
                 process_slice = slice(
                     self.accelerator.process_index * len(prompts),
                     (self.accelerator.process_index + 1) * len(prompts),
                 )
                 completion_ids = completion_ids[process_slice]
+                phase_timings["rollout_total"] = time.perf_counter() - rollout_started
 
             # Generate completions using colocated vLLM instances: each device holds vLLM copy and work on their own batch of prompts
             elif self.vllm_mode == "colocate":
@@ -1230,6 +1374,9 @@ class GRPOTrainer(Trainer):
         completion_ids_list = [
             [id.item() for id, m in zip(row, mask_row) if m] for row, mask_row in zip(completion_ids, completion_mask)
         ]
+        completion_lengths_for_trimming = torch.tensor(
+            [len(ids) for ids in completion_ids_list], dtype=torch.long
+        )
 
         # Sum along sequence dimension (dim=1) to get completion length per sequence, used for logging
         completion_lengths = completion_mask.sum(1)
@@ -1316,13 +1463,17 @@ class GRPOTrainer(Trainer):
                         # The external QRM owns one GPU. Gather each rank's local
                         # samples so it scores every completion exactly once, then
                         # broadcast and restore each rank's original slice.
-                        rank_payloads = gather_object([{
+                        qrm_started = time.perf_counter()
+                        gather_started = time.perf_counter()
+                        rank_payloads = self._gather_python_objects([{
                             "prompts": prompts,
                             "completions": completions,
                             "completion_ids": completion_ids_list,
                         }])
+                        phase_timings["qrm_gather"] += time.perf_counter() - gather_started
                         counts = [len(payload["prompts"]) for payload in rank_payloads]
                         if self.accelerator.is_main_process:
+                            service_started = time.perf_counter()
                             all_prompts = [item for payload in rank_payloads for item in payload["prompts"]]
                             all_completions = [item for payload in rank_payloads for item in payload["completions"]]
                             all_completion_ids = [
@@ -1333,11 +1484,15 @@ class GRPOTrainer(Trainer):
                                 completions=all_completions,
                                 completion_ids=all_completion_ids,
                             )
+                            phase_timings["qrm_service"] += time.perf_counter() - service_started
                         else:
                             output_reward_func = [None] * sum(counts)
-                        output_reward_func = broadcast_object_list(output_reward_func, from_process=0)
+                        broadcast_started = time.perf_counter()
+                        output_reward_func = self._broadcast_python_objects(output_reward_func, from_process=0)
+                        phase_timings["qrm_broadcast"] += time.perf_counter() - broadcast_started
                         start = sum(counts[: self.accelerator.process_index])
                         output_reward_func = output_reward_func[start : start + counts[self.accelerator.process_index]]
+                        phase_timings["qrm_total"] += time.perf_counter() - qrm_started
                     else:
                         output_reward_func = reward_func(
                             prompts=prompts, completions=completions, completion_ids=completion_ids_list, **reward_kwargs
@@ -1346,6 +1501,12 @@ class GRPOTrainer(Trainer):
                     output_reward_func = [reward if reward is not None else torch.nan for reward in output_reward_func]
 
                     rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
+
+        phase_timings["external_sync_wait"] = (
+            phase_timings["rollout_broadcast"] + phase_timings["qrm_broadcast"]
+        )
+        phase_timings["generation_score_total"] = time.perf_counter() - generation_started
+        self._record_phase_timings(mode, phase_timings)
 
         # If all reward functions return None for a given row, issue a detailed warning
         if torch.isnan(rewards_per_func).all(dim=1).any():
@@ -1434,13 +1595,13 @@ class GRPOTrainer(Trainer):
         self._metrics[mode]["frac_reward_zero_std"].append(is_std_zero.float().mean().item())
 
         # Log prompt and completion texts
-        self._textual_logs["prompt"].extend(gather_object(prompts_text))
-        self._textual_logs["completion"].extend(gather_object(completions_text))
+        self._textual_logs["prompt"].extend(self._gather_python_objects(prompts_text))
+        self._textual_logs["completion"].extend(self._gather_python_objects(completions_text))
         for i, name in enumerate(self.reward_func_names):
             self._textual_logs["rewards"][name].extend(rewards_per_func[:, i].tolist())
         self._textual_logs["advantages"].extend(all_process_advantages.tolist())
 
-        return {
+        result = {
             "prompt_ids": prompt_ids,
             "prompt_mask": prompt_mask,
             "completion_ids": completion_ids,
@@ -1448,6 +1609,10 @@ class GRPOTrainer(Trainer):
             "advantages": advantages,
             "old_per_token_logps": old_per_token_logps,
         }
+        if self.trim_unused_padding:
+            result["_prompt_lengths"] = prompt_lengths_for_trimming
+            result["_completion_lengths"] = completion_lengths_for_trimming
+        return result
 
     def compute_liger_loss(self, unwrapped_model, inputs):
         # Compute the per-token log probabilities for the model

@@ -185,7 +185,8 @@ def launch(args):
             "MAX_COMPLETION_LENGTH": "3072",
             "VLLM_MAX_MODEL_LEN": "6144",
             "QRM_MAX_LENGTH": "6144",
-            "REWARD_BATCH_SIZE": "1",
+            "QRM_MAX_BATCH_TOKENS": "6144",
+            "REWARD_BATCH_SIZE": "4",
             "MERGE_AFTER_TRAINING": "0",
         }
         for key, value in defaults.items():
@@ -197,19 +198,30 @@ def launch(args):
     os.execvpe(command[0], command, env)
 
 
+def resolve_run_directory(run_dir=None):
+    if run_dir:
+        return Path(run_dir).expanduser()
+    if os.environ.get("RUN_DIR"):
+        return Path(os.environ["RUN_DIR"]).expanduser()
+    if os.environ.get("RUN_NAME"):
+        return paths()["GRPO_OUTPUT_ROOT"] / os.environ["RUN_NAME"]
+    output = paths()["GRPO_OUTPUT_ROOT"]
+    directories = [p for p in output.iterdir() if p.is_dir() and (p / "logs").is_dir()] if output.exists() else []
+    if not directories:
+        raise ValueError(f"No runs under {output}; use --run-dir for a custom path")
+    return max(directories, key=lambda p: p.stat().st_mtime_ns)
+
+
+def validate(args):
+    directory = resolve_run_directory(args.run_dir)
+    command = [sys.executable, str(ROOT / "scripts/validate_training_run.py"), str(directory)]
+    if args.require_merged:
+        command.append("--require-merged")
+    return subprocess.run(command, check=False).returncode
+
+
 def logs(args):
-    if args.run_dir:
-        directory = Path(args.run_dir).expanduser()
-    elif os.environ.get("RUN_DIR"):
-        directory = Path(os.environ["RUN_DIR"]).expanduser()
-    elif os.environ.get("RUN_NAME"):
-        directory = paths()["GRPO_OUTPUT_ROOT"] / os.environ["RUN_NAME"]
-    else:
-        output = paths()["GRPO_OUTPUT_ROOT"]
-        directories = [p for p in output.iterdir() if p.is_dir() and (p / "logs").is_dir()] if output.exists() else []
-        if not directories:
-            raise ValueError(f"No runs under {output}; use --run-dir for a custom path")
-        directory = max(directories, key=lambda p: p.stat().st_mtime_ns)
+    directory = resolve_run_directory(args.run_dir)
     filename = {"vllm": "vllm_server.log", "qrm": "qrm_server.log", "training": "training.log", "merge": "merge_lora.log"}[args.service]
     log_path = directory / "logs" / filename
     print(f"Log: {log_path}", flush=True)
@@ -238,6 +250,10 @@ def main(argv=None):
         run = subparsers.add_parser(name, help="two-step smoke defaults" if name == "smoke" else "run the training recipe")
         run.add_argument("--dry-run", action="store_true", help="validate and print configuration without loading a model")
         run.set_defaults(func=launch)
+    validation = subparsers.add_parser("validate", help="validate artifacts and timing evidence for a completed run")
+    validation.add_argument("--run-dir")
+    validation.add_argument("--require-merged", action="store_true", help="also require merged model files")
+    validation.set_defaults(func=validate)
     log = subparsers.add_parser("logs", help="read a selected run's logs (latest run by default)")
     log.add_argument("--run-dir")
     log.add_argument("--service", choices=("vllm", "qrm", "training", "merge"), default="vllm")

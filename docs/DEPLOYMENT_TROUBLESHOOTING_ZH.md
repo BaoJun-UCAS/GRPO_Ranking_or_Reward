@@ -19,6 +19,8 @@
 | 生成、奖励打分成功，首次反向传播报 `CheckpointError`，权重 shape 变成 `[0]` | PEFT 冻结参数在 ZeRO-3 非重入 checkpoint 重算中被释放；本机 Torch/DeepSpeed 源码与上游报告对应 | 固定版本 recipe 使用 `use_reentrant: true`；正确传递 checkpoint kwargs 并启用输入梯度；启动前拒绝该不兼容组合，不关闭 metadata 检查 |
 | 进程结束后难判断是否有残留 | 旧父进程可能仍活着；`tail -f ...vllm...` 也会被宽泛关键词匹配 | 启动器管理自己创建的进程；排查时核对 UID、PID、父子关系和实际监听端口 |
 | 不知道模型下载到哪里、奖励模型在哪里运行 | 缓存变量和多个终端可能不一致；vLLM 日志不代表 QRM 服务状态 | `download` 与 `cache` 使用同一缓存解析规则；默认 QRM 在物理 GPU 5 独立加载，并写入 `qrm_server.log` |
+| 外部服务忙时 GPU6 空闲而 GPU7 长期接近 100% | rank0 调用 vLLM/QRM，rank1 阻塞在 object broadcast；NCCL 等待 kernel 也会计入 GPU Util，不能视为有效 policy 训练 | 四卡 recipe 把 Python 对象通信移到 CPU/Gloo；用 `timing/rollout_total_*`、`timing/qrm_total_*`、`timing/external_sync_wait_*`、`timing/policy_train_total_*` 区分服务、等待和训练 |
+| 训练进程退出 0，但 run 最终标为 failed | launcher 的 CPU-only 验收发现步数、NaN/Infinity、计时 rank、一批 QRM token 上限或模型产物不满足契约 | 查看 `validation_report.json` 的 `errors` 和 `logs/validation.log`；修复原因后重新训练，不要手工把 `RUN_STATUS` 改成 success |
 
 ## vLLM 健康检查失败：已知原因与验证边界
 

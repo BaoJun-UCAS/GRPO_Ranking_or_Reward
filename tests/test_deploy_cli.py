@@ -84,6 +84,17 @@ assert not {'torch', 'vllm', 'transformers', 'huggingface_hub'} & sys.modules.ke
         self.assertEqual(actual["MERGE_AFTER_TRAINING"], "0")
         self.assertNotIn("GENERATION_BATCH_SIZE", actual)
 
+    def test_validate_uses_active_python_and_passes_merged_contract(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(subprocess, "run") as run:
+            run.return_value.returncode = 7
+            result = cli.main(["validate", "--run-dir", directory, "--require-merged"])
+        self.assertEqual(result, 7)
+        command = run.call_args.args[0]
+        self.assertEqual(command[0], sys.executable)
+        self.assertEqual(command[1], str(ROOT / "scripts/validate_training_run.py"))
+        self.assertEqual(command[2], directory)
+        self.assertIn("--require-merged", command)
+
     def test_cache_report_counts_blobs_once_without_snapshot_symlinks(self):
         with tempfile.TemporaryDirectory() as directory:
             blobdir = Path(directory) / "models--org--model/blobs"

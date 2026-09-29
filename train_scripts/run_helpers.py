@@ -16,7 +16,7 @@ import yaml
 
 
 INTEGER_VARIABLES = {
-    "VLLM_HTTP_PORT", "VLLM_GROUP_PORT", "QRM_HTTP_PORT", "QRM_REQUEST_TIMEOUT",
+    "VLLM_HTTP_PORT", "VLLM_GROUP_PORT", "QRM_HTTP_PORT", "QRM_REQUEST_TIMEOUT", "QRM_MAX_BATCH_TOKENS",
     "MAX_PROMPT_LENGTH", "MAX_COMPLETION_LENGTH", "GENERATION_BATCH_SIZE", "GRADIENT_ACCUMULATION_STEPS",
     "MAX_STEPS", "NUM_GENERATIONS", "PER_DEVICE_TRAIN_BATCH_SIZE",
 }
@@ -66,6 +66,10 @@ def resolve(config_path, accelerate_path, env):
     gpu_ids = [int(item) for item in gpu_text.split(",")]
     vllm_gpu_ids = [int(item) for item in vllm_gpu_text.split(",")]
     qrm_gpu_id = int(qrm_gpu_text)
+    qrm_max_length = positive_int("QRM_MAX_LENGTH", env)
+    positive_int("REWARD_BATCH_SIZE", env)
+    if variables["QRM_MAX_BATCH_TOKENS"] < qrm_max_length:
+        raise ValueError("QRM_MAX_BATCH_TOKENS must be at least QRM_MAX_LENGTH")
     if len(set(gpu_ids)) != len(gpu_ids):
         raise ValueError("TRAIN_GPUS contains duplicate GPU indices")
     if len(set(vllm_gpu_ids)) != len(vllm_gpu_ids):
@@ -194,6 +198,9 @@ def main():
             print(f"Training processes: {accelerate['num_processes']}; generation batch: {config['generation_batch_size']}")
             print(f"Ports: vLLM HTTP={os.environ['VLLM_HTTP_PORT']}, QRM HTTP={os.environ['QRM_HTTP_PORT']}, "
                   f"training={os.environ['PORT']}, weight sync={os.environ['VLLM_GROUP_PORT']}")
+            print(f"QRM batching: max examples={os.environ['REWARD_BATCH_SIZE']}; "
+                  f"padded-token budget={os.environ['QRM_MAX_BATCH_TOKENS']}; "
+                  f"max length={os.environ['QRM_MAX_LENGTH']}")
             print(f"Output: {os.environ['OUTPUT_DIR']}")
             print(f"HF_HOME: {os.environ['HF_HOME']}; HF_HUB_CACHE: {os.environ['HF_HUB_CACHE']}")
             if os.environ["DRY_RUN"] == "1":
