@@ -118,3 +118,17 @@ assert not {'torch', 'vllm', 'transformers', 'huggingface_hub'} & sys.modules.ke
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_download_respects_independent_model_revisions(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    download = Mock(return_value="/cached/model")
+    monkeypatch.setitem(sys.modules, "huggingface_hub", SimpleNamespace(snapshot_download=download))
+    for key, value in {"MODEL_NAME": "org/policy", "MODEL_REVISION": "policy-commit",
+                       "QRM_MODEL": "org/reward", "QRM_REVISION": "reward-commit"}.items():
+        monkeypatch.setenv(key, value)
+    assert cli.main(["download"]) == 0
+    assert [(call.kwargs["repo_id"], call.kwargs["revision"]) for call in download.call_args_list] == [
+        ("org/policy", "policy-commit"), ("org/reward", "reward-commit"),
+    ]

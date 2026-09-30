@@ -54,6 +54,8 @@ from trl.models import create_reference_model, prepare_deepspeed, prepare_fsdp, 
 from trl.models.utils import _ForwardRedirection
 from trl.trainer.callbacks import SyncRefModelCallback
 from .configs import GRPOConfig
+from .advantages import compute_advantages, configure_advantage
+from .objectives import reduce_policy_loss
 from trl.trainer.utils import (
     disable_dropout_in_model,
     generate_model_card,
@@ -429,6 +431,13 @@ class GRPOTrainer(Trainer):
             model_name = model_name.split("/")[-1]
             args = GRPOConfig(f"{model_name}-GRPO")
 
+        # Resolve custom estimators before loading any large model weights.
+        self.advantage_estimator, self.advantage_kwargs = configure_advantage(
+            args.advantage,
+            getattr(args, "advantage_kwargs", None),
+            scale_rewards=args.scale_rewards,
+        )
+
         # Models
         # Trained model
         model_init_kwargs = args.model_init_kwargs or {}
@@ -641,6 +650,8 @@ class GRPOTrainer(Trainer):
 
         # Liger loss
         if self.use_liger_loss:
+            if args.token_broadcast != "uniform":
+                raise ValueError("use_liger_loss only supports token_broadcast='uniform'")
             if not is_liger_kernel_available():
                 raise ImportError(
                     "Liger is required to use `liger_loss` as the GRPO loss. Run `pip install liger-kernel`."
@@ -1001,7 +1012,9 @@ class GRPOTrainer(Trainer):
     def _get_last_hidden_state(self, unwrapped_model, input_ids, attention_mask, logits_to_keep=None):
         if is_peft_model(unwrapped_model):
             unwrapped_model = unwrapped_model.base_model.model
-        last_hidden_state = unwrapped_model.model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+        last_hidden_state = unwrapped_model.model(
+            input_ids=input_ids, attention_mask=attention_mask, use_cache=False
+        ).last_hidden_state
         last_hidden_state = last_hidden_state[:, :-1, :]  # (B, L-1, H)
         if logits_to_keep is not None:
             last_hidden_state = last_hidden_state[:, -logits_to_keep:, :]  # (B, logits_to_keep, H)
@@ -1018,7 +1031,8 @@ class GRPOTrainer(Trainer):
 
             # We add 1 to `logits_to_keep` because the last logits of the sequence is later excluded
             logits = model(
-                input_ids=input_ids_batch, attention_mask=attention_mask_batch, logits_to_keep=logits_to_keep + 1
+                input_ids=input_ids_batch, attention_mask=attention_mask_batch,
+                logits_to_keep=logits_to_keep + 1, use_cache=False,
             ).logits
             logits = logits[:, :-1, :]  # (B, L-1, V), exclude the last logit: it corresponds to the next token pred
             input_ids_batch = input_ids_batch[:, -logits_to_keep:]
@@ -1519,8 +1533,8 @@ class GRPOTrainer(Trainer):
                 "Please ensure that at least one reward function returns a valid reward."
             )
 
-        # Gather the reward per function: this part is crucial, because the rewards are normalized per group and the
-        # completions may be distributed across processes
+        # Gather rewards before group-wise advantage computation: one prompt's
+        # completions may be distributed across processes.
         rewards_per_func = gather(rewards_per_func)
 
         # Apply weights to each reward function's output and sum
@@ -1530,27 +1544,20 @@ class GRPOTrainer(Trainer):
         if self.save_reward_data:
             self._collect_reward_data(prompts, completions, rewards, self.state.global_step)
 
-        # Compute grouped-wise rewards
-        mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
-        std_grouped_rewards = rewards.view(-1, self.num_generations).std(dim=1)
+        # Advantage estimators always receive complete global groups, including
+        # groups whose completions straddle distributed rank boundaries.
+        advantage_result = compute_advantages(
+            rewards,
+            self.num_generations,
+            method=self.advantage_estimator,
+            method_kwargs=self.advantage_kwargs,
+            rewards_per_func=rewards_per_func,
+            reward_weights=self.reward_weights.to(device),
+        )
+        mean_grouped_rewards = advantage_result.group_mean
+        std_grouped_rewards = advantage_result.group_std
         is_std_zero = torch.isclose(std_grouped_rewards, torch.zeros_like(std_grouped_rewards))
-
-        # Normalize the rewards to compute the advantages
-        mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
-        std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
-
-        # Compute advantages based on config
-        if self.args.advantage == "studentization":
-            # Option 1: Studentization (normalize rewards)
-            advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4)
-        elif self.args.advantage == "ranking":
-            # Option 2: Ranking approach
-            rewards_grouped = rewards.view(-1, self.num_generations)  # Shape: (num_prompts, num_generations)
-            ranks = torch.argsort(torch.argsort(rewards_grouped, dim=1, descending=True), dim=1) + 1  # Shape: (num_prompts, num_generations)
-            values = 2.0 - 4.0 * (ranks.float() - 1.0) / (self.num_generations - 1)  # Shape: (num_prompts, num_generations)
-            advantages = values.view(-1)  # Shape: (num_prompts * num_generations,)
-        else:
-            raise ValueError(f"Invalid advantage method: {self.args.advantage}. Must be 'studentization' or 'ranking'")
+        advantages = advantage_result.advantages
 
         # Slice to keep only the local part of the data
         process_slice = slice(
@@ -1594,12 +1601,15 @@ class GRPOTrainer(Trainer):
         self._metrics[mode]["reward_std"].append(std_grouped_rewards.mean().item())
         self._metrics[mode]["frac_reward_zero_std"].append(is_std_zero.float().mean().item())
 
-        # Log prompt and completion texts
-        self._textual_logs["prompt"].extend(self._gather_python_objects(prompts_text))
-        self._textual_logs["completion"].extend(self._gather_python_objects(completions_text))
-        for i, name in enumerate(self.reward_func_names):
-            self._textual_logs["rewards"][name].extend(rewards_per_func[:, i].tolist())
-        self._textual_logs["advantages"].extend(all_process_advantages.tolist())
+        # Gathering complete conversations is expensive and only serves the
+        # optional completion table. Scalar metrics/reward persistence are
+        # independent and must not pay for two extra object collectives.
+        if self.log_completions:
+            self._textual_logs["prompt"].extend(self._gather_python_objects(prompts_text))
+            self._textual_logs["completion"].extend(self._gather_python_objects(completions_text))
+            for i, name in enumerate(self.reward_func_names):
+                self._textual_logs["rewards"][name].extend(rewards_per_func[:, i].tolist())
+            self._textual_logs["advantages"].extend(all_process_advantages.tolist())
 
         result = {
             "prompt_ids": prompt_ids,
@@ -1739,48 +1749,35 @@ class GRPOTrainer(Trainer):
         per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
         if self.beta != 0.0:
             per_token_loss = per_token_loss + self.beta * per_token_kl
-        loss = (per_token_loss * completion_mask).sum() / completion_mask.sum()
-
-        # from TRL 1.18.0
-        # Without per-token weighting
-        # per_token_loss1 = coef_1 * advantages.unsqueeze(1)
-        # per_token_loss2 = coef_2 * advantages.unsqueeze(1)
-        # per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
-        # if self.beta != 0.0:
-        #     per_token_loss = per_token_loss + self.beta * per_token_kl
-
-        # if self.loss_type == "grpo":
-        #     loss = ((per_token_loss * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)).mean()
-        # elif self.loss_type == "bnpo":
-        #     loss = (per_token_loss * completion_mask).sum() / completion_mask.sum().clamp(min=1.0)
-        # elif self.loss_type == "dr_grpo":
-        #     loss = (per_token_loss * completion_mask).sum() / (per_token_loss.size(0) * self.max_completion_length)
-        # else:
-        #     raise ValueError(f"Unknown loss type: {self.loss_type}")
+        loss = reduce_policy_loss(per_token_loss, completion_mask, self.loss_type, self.max_completion_length)
+        valid_tokens = completion_mask.sum().clamp(min=1)
 
         # Log the metrics
         mode = "train" if self.model.training else "eval"
-
-        if self.beta != 0.0:
-            mean_kl = (per_token_kl * completion_mask).sum() / completion_mask.sum()
-            self._metrics[mode]["kl"].append(self.accelerator.gather(mean_kl).nanmean().item())
 
         # Compute the clipped probability ratios
         is_low_clipped = (coef_1 < 1 - self.epsilon_low) & (advantages.unsqueeze(1) < 0)
         is_high_clipped = (coef_1 > 1 + self.epsilon_high) & (advantages.unsqueeze(1) > 0)
         is_region_clipped = is_low_clipped | is_high_clipped
 
-        low_clip = (is_low_clipped * completion_mask).sum() / completion_mask.sum()
-        high_clip = (is_high_clipped * completion_mask).sum() / completion_mask.sum()
-        clip_ratio = (is_region_clipped * completion_mask).sum() / completion_mask.sum()
+        low_clip = (is_low_clipped * completion_mask).sum() / valid_tokens
+        high_clip = (is_high_clipped * completion_mask).sum() / valid_tokens
+        clip_ratio = (is_region_clipped * completion_mask).sum() / valid_tokens
 
-        gathered_low_clip = self.accelerator.gather(low_clip)
+        # One collective per micro-step, with rows preserving rank boundaries.
+        # Every rank uses the same columns because beta is shared configuration.
+        local_metrics = [low_clip, high_clip, clip_ratio]
+        if self.beta != 0.0:
+            mean_kl = (per_token_kl * completion_mask).sum() / valid_tokens
+            local_metrics.append(mean_kl.detach())
+        gathered_metrics = self.accelerator.gather(torch.stack(local_metrics).unsqueeze(0))
+        gathered_low_clip, gathered_high_clip, gathered_clip_ratio = gathered_metrics[:, :3].unbind(dim=1)
+        if self.beta != 0.0:
+            self._metrics[mode]["kl"].append(gathered_metrics[:, 3].nanmean().item())
         self._metrics[mode]["clip_ratio/low_mean"].append(gathered_low_clip.nanmean().item())
         self._metrics[mode]["clip_ratio/low_min"].append(nanmin(gathered_low_clip).item())
-        gathered_high_clip = self.accelerator.gather(high_clip)
         self._metrics[mode]["clip_ratio/high_mean"].append(gathered_high_clip.nanmean().item())
         self._metrics[mode]["clip_ratio/high_max"].append(nanmax(gathered_high_clip).item())
-        gathered_clip_ratio = self.accelerator.gather(clip_ratio)
         self._metrics[mode]["clip_ratio/region_mean"].append(gathered_clip_ratio.nanmean().item())
         return loss
 
@@ -1801,7 +1798,9 @@ class GRPOTrainer(Trainer):
         if mode == "eval":
             metrics = {f"eval_{key}": val for key, val in metrics.items()}
 
-        logs = {**logs, **metrics}
+        # Trainer.evaluate returns this same mapping and passes it to callbacks.
+        # Update it so reward metrics also reach eval_results.json and model selection.
+        logs.update(metrics)
         if version.parse(transformers.__version__) >= version.parse("4.47.0.dev0"):
             super().log(logs, start_time)
         else:  # transformers<=4.46

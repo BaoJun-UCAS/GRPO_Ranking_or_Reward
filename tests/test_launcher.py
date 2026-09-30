@@ -29,6 +29,11 @@ def launch_env(tmp_path):
         "GRPO_CACHE_ROOT", "RUN_DIR", "GENERATION_BATCH_SIZE", "CONFIG_FILE", "ACCELERATE_CONFIG",
         "RESUME_FROM_CHECKPOINT", "CUDA_VISIBLE_DEVICES", "VLLM_PORT", "VLLM_HTTP_PORT", "VLLM_GPUS",
         "VLLM_GPU", "QRM_GPU", "QRM_HTTP_PORT", "QRM_MODEL", "QRM_MAX_BATCH_TOKENS",
+        "MODEL_REVISION", "ADVANTAGE", "ADVANTAGE_KWARGS", "DATASET_CONFIG", "DATASET_ADAPTER",
+        "DATASET_PROMPT_COLUMN", "DATASET_TRAIN_SPLIT", "DATASET_TEST_SPLIT", "SYSTEM_PROMPT",
+        "DO_EVAL", "EVAL_STRATEGY", "EVAL_STEPS", "MAX_TRAIN_SAMPLES", "MAX_EVAL_SAMPLES",
+        "PER_DEVICE_EVAL_BATCH_SIZE", "ATTN_IMPLEMENTATION", "LOSS_TYPE", "GRADIENT_CHECKPOINTING",
+        "LOG_COMPLETIONS", "SAVE_REWARD_DATA",
     ):
         env.pop(name, None)
     env.update(
@@ -353,6 +358,7 @@ def assert_workers_stopped(state):
 def test_training_exit_preserves_status_and_reaps_workers(fake_runtime, train_exit):
     env, state = fake_runtime
     env["FAKE_TRAIN_EXIT"] = str(train_exit)
+    env["MODEL_REVISION"] = "pinned-policy-commit"
     result = run_launcher(env)
     assert result.returncode == train_exit, result.stdout
     qrm = json.loads((state / "qrm.json").read_text())
@@ -365,6 +371,9 @@ def test_training_exit_preserves_status_and_reaps_workers(fake_runtime, train_ex
     training = json.loads((state / "train.json").read_text())
     assert qrm["args"][qrm["args"].index("--batch-size") + 1] == "2"
     server = json.loads((state / "server.json").read_text())
+    assert server["args"][server["args"].index("--revision") + 1] == "pinned-policy-commit"
+    config = yaml.safe_load((run / "config/resolved_training_config.yaml").read_text())
+    assert config["model_revision"] == "pinned-policy-commit"
     assert qrm["args"][qrm["args"].index("--model") + 1] == env.get("QRM_MODEL", "friendshipkim/QRM-Llama3.1-8B-v2")
     assert qrm["args"][qrm["args"].index("--port") + 1] == env["QRM_HTTP_PORT"]
     assert qrm["args"][qrm["args"].index("--max-length") + 1] == env["QRM_MAX_LENGTH"]
@@ -503,3 +512,113 @@ def test_interrupt_cleans_all_owned_process_groups(fake_runtime, termination_sig
                 os.killpg(group, signal.SIGKILL)
             except ProcessLookupError:
                 pass
+
+
+def resolved_yaml(output):
+    return yaml.safe_load(output.split("Resolved training configuration:\n", 1)[1].split(
+        "Resolved Accelerate configuration:", 1
+    )[0])
+
+
+def test_optional_overrides_preserve_types_and_reach_custom_recipe(launch_env, tmp_path):
+    recipe = yaml.safe_load((PROJECT / "recipes/Qwen3-1.7B/config_chat_regular_qrm_lora_4gpu_split.yaml").read_text())
+    recipe["advantage"] = "recipe_default"
+    recipe["dataset_adapter"] = "recipe_adapter"
+    custom = tmp_path / "custom.yaml"
+    custom.write_text(yaml.safe_dump(recipe))
+    launch_env.update(
+        CONFIG_FILE=str(custom), MODEL_REVISION="commit-123", ADVANTAGE="custom.module:compute",
+        ADVANTAGE_KWARGS='{"rank_weight": 0.25, "epsilon": 0.001}',
+        DATASET_ADAPTER="chat", DATASET_PROMPT_COLUMN="messages", DATASET_CONFIG="subset: #1",
+        DATASET_TRAIN_SPLIT="train[:10%]", DATASET_TEST_SPLIT="validation",
+        DO_EVAL="true", MAX_TRAIN_SAMPLES="16", MAX_EVAL_SAMPLES="8", EVAL_STEPS="3",
+        SYSTEM_PROMPT="A prompt: # not a comment", GRADIENT_CHECKPOINTING="0",
+    )
+    result = run_launcher(launch_env, "--dry-run")
+    assert result.returncode == 0, result.stdout
+    config = resolved_yaml(result.stdout)
+    assert config["model_revision"] == "commit-123"
+    assert config["advantage"] == "custom.module:compute"
+    assert config["advantage_kwargs"] == {"rank_weight": 0.25, "epsilon": 0.001}
+    assert config["dataset_adapter"] == "chat"
+    assert config["dataset_prompt_column"] == "messages"
+    assert config["dataset_config"] == "subset: #1"
+    assert config["dataset_train_split"] == "train[:10%]"
+    assert config["dataset_test_split"] == "validation"
+    assert config["do_eval"] is True
+    assert config["gradient_checkpointing"] is False
+    assert config["max_train_samples"] == 16
+    assert config["max_eval_samples"] == 8
+    assert config["system_prompt"] == "A prompt: # not a comment"
+
+
+@pytest.mark.parametrize("overrides,message", [
+    ({"ADVANTAGE_KWARGS": "[]"}, "must be a JSON object"),
+    ({"ADVANTAGE_KWARGS": "{"}, "must be a JSON object"),
+    ({"DO_EVAL": "yes"}, "must be 0, 1, false or true"),
+    ({"MAX_TRAIN_SAMPLES": "0"}, "must be a positive integer"),
+    ({"DO_EVAL": "1", "PER_DEVICE_EVAL_BATCH_SIZE": "1"}, "Evaluation requires"),
+    ({"EVAL_STRATEGY": "sometimes"}, "EVAL_STRATEGY"),
+])
+def test_invalid_optional_overrides_fail_before_start(launch_env, overrides, message):
+    launch_env.update(overrides)
+    result = run_launcher(launch_env, "--dry-run")
+    assert result.returncode != 0
+    assert message in result.stdout
+
+
+def test_ddp_lora_configuration_is_available_without_unused_parameter_traversal(launch_env):
+    launch_env["ACCELERATE_CONFIG"] = str(PROJECT / "recipes/accelerate_configs/ddp_2gpus.yaml")
+    result = run_launcher(launch_env, "--dry-run")
+    assert result.returncode == 0, result.stdout
+    assert "distributed_type: MULTI_GPU" in result.stdout
+    assert resolved_yaml(result.stdout)["ddp_find_unused_parameters"] is False
+
+
+def test_ranking_entrypoint_reuses_split_launcher(launch_env):
+    result = subprocess.run(
+        ["bash", str(PROJECT / "train_scripts/qwen3_1.7_grpo_ranking_chat.sh"), "--dry-run"],
+        env=launch_env, cwd=PROJECT, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=20,
+    )
+    assert result.returncode == 0, result.stdout
+    assert resolved_yaml(result.stdout)["advantage"] == "ranking"
+    assert "QRM GPU 3; training GPUs 1,2" in result.stdout
+
+
+@pytest.mark.parametrize("baseline", ["studentization", "grpo"])
+def test_robust_pairwise_switch_changes_only_advantage_configuration(launch_env, tmp_path, baseline):
+    recipe = yaml.safe_load((PROJECT / "recipes/Qwen3-1.7B/config_chat_regular_qrm_lora_4gpu_split.yaml").read_text())
+    recipe["delta"] = 1.5  # TRL's PPO clipping option must remain independent.
+    recipe["scale_rewards"] = True
+    custom = tmp_path / "same-experiment.yaml"
+    custom.write_text(yaml.safe_dump(recipe))
+    launch_env["CONFIG_FILE"] = str(custom)
+    baseline_env = {**launch_env, "ADVANTAGE": baseline, "ADVANTAGE_KWARGS": "{}"}
+    baseline_result = run_launcher(baseline_env, "--dry-run")
+    assert baseline_result.returncode == 0, baseline_result.stdout
+    baseline_config = resolved_yaml(baseline_result.stdout)
+
+    robust_env = {
+        **launch_env,
+        "ADVANTAGE": "robust_pairwise",
+        "ADVANTAGE_KWARGS": '{"delta":0.02,"c":0.2}',
+    }
+    robust_result = run_launcher(robust_env, "--dry-run")
+    assert robust_result.returncode == 0, robust_result.stdout
+    robust_config = resolved_yaml(robust_result.stdout)
+    assert baseline_config.pop("advantage") == baseline
+    assert baseline_config.pop("advantage_kwargs") == {}
+    assert robust_config.pop("advantage") == "robust_pairwise"
+    assert robust_config.pop("advantage_kwargs") == {"delta": 0.02, "c": 0.2}
+    # In particular, nested delta must not override TRL's separate PPO delta.
+    assert robust_config == baseline_config
+    assert robust_config["delta"] == 1.5
+    assert robust_config["scale_rewards"] is True
+
+
+def test_default_advantage_remains_studentization(launch_env):
+    result = run_launcher(launch_env, "--dry-run")
+    assert result.returncode == 0, result.stdout
+    config = resolved_yaml(result.stdout)
+    assert config["advantage"] == "studentization"
+    assert config["advantage_kwargs"] == {}

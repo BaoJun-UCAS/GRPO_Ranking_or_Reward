@@ -19,6 +19,22 @@ Set environment variables before invoking this script:
   QRM_GPU=5                   Dedicated 8B reward-model server GPU
   TRAIN_GPUS=6,7              Policy training GPUs
   MODEL_NAME=Qwen/Qwen3-1.7B    Model ID or local path
+  MODEL_REVISION=main          Same policy/tokenizer revision for trainer and vLLM
+  ADVANTAGE                   studentization (alias grpo), robust_pairwise, ranking,
+                               rank_reward, or module:function; default: studentization
+  ADVANTAGE_KWARGS             JSON object, e.g. '{"delta":0.01,"c":0.08}' for robust_pairwise
+                               These defaults are uncalibrated weighted-reward units.
+                               No group-std normalization; scale_rewards has no effect.
+                               Nested delta is distinct from the top-level PPO delta.
+  DATASET_CONFIG / DATASET_ADAPTER / DATASET_PROMPT_COLUMN
+  DATASET_TRAIN_SPLIT / DATASET_TEST_SPLIT / SYSTEM_PROMPT
+                               Optional overrides; otherwise use the YAML values
+  DO_EVAL=0                   Set 1 for final GRPO evaluation; requires test split
+  PER_DEVICE_EVAL_BATCH_SIZE   Global eval batch must divide into generation groups
+  EVAL_STRATEGY / EVAL_STEPS    Optional evaluation during training
+  MAX_TRAIN_SAMPLES / MAX_EVAL_SAMPLES  Optional deterministic smoke-test subsets
+  ATTN_IMPLEMENTATION / LOSS_TYPE / GRADIENT_CHECKPOINTING
+  LOG_COMPLETIONS / SAVE_REWARD_DATA  Optional training YAML overrides
   QRM_MODEL=friendshipkim/QRM-Llama3.1-8B-v2
   PER_DEVICE_TRAIN_BATCH_SIZE=1 NUM_GENERATIONS=8
   QRM_REVISION=main             Pin a commit hash for formal runs
@@ -46,7 +62,8 @@ Set environment variables before invoking this script:
                                Build caches default to subdirectories of GRPO_CACHE_ROOT
   CONFIG_FILE                  Training YAML template
   ACCELERATE_CONFIG            Single-machine Accelerate config; process count
-                               is resolved from TRAIN_GPUS
+                               is resolved from TRAIN_GPUS; DEEPSPEED or MULTI_GPU
+                               e.g. recipes/accelerate_configs/ddp_2gpus.yaml
   MERGE_AFTER_TRAINING=1        Set 0 to retain only the LoRA adapter
   WANDB_MODE=offline WANDB_PROJECT=GRPO
   PYTHON=python                Interpreter from the active environment
@@ -111,6 +128,7 @@ GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-128}"
 QRM_REVISION="${QRM_REVISION:-main}"
 MAX_STEPS="${MAX_STEPS:-800}"
 MODEL_NAME="${MODEL_NAME:-Qwen/Qwen3-1.7B}"
+MODEL_REVISION="${MODEL_REVISION:-main}"
 QRM_MODEL="${QRM_MODEL:-friendshipkim/QRM-Llama3.1-8B-v2}"
 CONFIG_FILE="${CONFIG_FILE:-recipes/Qwen3-1.7B/config_chat_regular_qrm_lora_4gpu_split.yaml}"
 ACCELERATE_CONFIG="${ACCELERATE_CONFIG:-recipes/accelerate_configs/zero2_2gpus.yaml}"
@@ -166,7 +184,7 @@ export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"
 export TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-${GRPO_CACHE_ROOT}/torch_extensions}"
 export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-${GRPO_CACHE_ROOT}/triton}"
 export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-${GRPO_CACHE_ROOT}/vllm}"
-export RUN_NAME RUN_TOKEN OUTPUT_DIR DATASET_NAME MODEL_NAME QRM_MODEL QRM_REVISION VLLM_HTTP_PORT VLLM_GROUP_PORT QRM_HTTP_PORT
+export RUN_NAME RUN_TOKEN OUTPUT_DIR DATASET_NAME MODEL_NAME MODEL_REVISION QRM_MODEL QRM_REVISION VLLM_HTTP_PORT VLLM_GROUP_PORT QRM_HTTP_PORT
 export QRM_GPU QRM_REQUEST_TIMEOUT QRM_MAX_LENGTH QRM_MAX_BATCH_TOKENS
 export SERVICE_SHUTDOWN_GRACE_SECONDS REWARD_BATCH_SIZE
 export MAX_PROMPT_LENGTH MAX_COMPLETION_LENGTH GENERATION_BATCH_SIZE
@@ -285,7 +303,7 @@ if [[ -s "${OUTPUT_DIR}/config/untracked-files.txt" ]]; then
         --verbatim-files-from --files-from "${OUTPUT_DIR}/config/untracked-files.txt"
 fi
 {
-    for key in RUN_NAME RUN_TOKEN OUTPUT_DIR MODEL_NAME QRM_MODEL QRM_REVISION DATASET_NAME VLLM_GPUS QRM_GPU TRAIN_GPUS CUDA_DEVICE_ORDER \
+    for key in RUN_NAME RUN_TOKEN OUTPUT_DIR MODEL_NAME MODEL_REVISION QRM_MODEL QRM_REVISION DATASET_NAME VLLM_GPUS QRM_GPU TRAIN_GPUS CUDA_DEVICE_ORDER \
         NUM_VLLM_GPUS NUM_TRAIN_GPUS VLLM_HTTP_PORT QRM_HTTP_PORT PORT VLLM_GROUP_PORT \
         VLLM_MAX_MODEL_LEN VLLM_GPU_MEMORY_UTILIZATION VLLM_STARTUP_TIMEOUT \
         QRM_MAX_LENGTH QRM_MAX_BATCH_TOKENS REWARD_BATCH_SIZE QRM_REQUEST_TIMEOUT QRM_STARTUP_TIMEOUT \
@@ -295,6 +313,12 @@ fi
         WANDB_MODE MAX_STEPS GENERATION_BATCH_SIZE RESUME_FROM_CHECKPOINT \
         NUM_GENERATIONS PER_DEVICE_TRAIN_BATCH_SIZE GRADIENT_ACCUMULATION_STEPS; do
         printf '%s=%q\n' "${key}" "${!key}"
+    done
+    for key in ADVANTAGE ADVANTAGE_KWARGS DATASET_CONFIG DATASET_ADAPTER DATASET_PROMPT_COLUMN \
+        DATASET_TRAIN_SPLIT DATASET_TEST_SPLIT SYSTEM_PROMPT DO_EVAL EVAL_STRATEGY EVAL_STEPS \
+        MAX_TRAIN_SAMPLES MAX_EVAL_SAMPLES PER_DEVICE_EVAL_BATCH_SIZE ATTN_IMPLEMENTATION LOSS_TYPE \
+        GRADIENT_CHECKPOINTING LOG_COMPLETIONS SAVE_REWARD_DATA; do
+        if [[ -v "${key}" ]]; then printf '%s=%q\n' "${key}" "${!key}"; fi
     done
     printf 'started_utc=%s\n' "${RUN_STAMP}"
     printf 'CUDA_HOME=%q\n' "${CUDA_HOME:-}"
@@ -353,7 +377,7 @@ VLLM_HEALTH_URL="http://127.0.0.1:${VLLM_HTTP_PORT}/health/${RUN_TOKEN}/"
 VLLM_LOG="${OUTPUT_DIR}/logs/vllm_server.log"
 echo "Starting TP=${NUM_VLLM_GPUS} vLLM on physical GPUs ${VLLM_GPUS}; log: ${VLLM_LOG}"
 setsid env CUDA_VISIBLE_DEVICES="${VLLM_GPUS}" TMPDIR="${VLLM_TMPDIR}" "${PYTHON}" -m open_r1.vllm_serve \
-    --model "${MODEL_NAME}" --host 127.0.0.1 --port "${VLLM_HTTP_PORT}" \
+    --model "${MODEL_NAME}" --revision "${MODEL_REVISION}" --host 127.0.0.1 --port "${VLLM_HTTP_PORT}" \
     --tensor_parallel_size "${NUM_VLLM_GPUS}" --gpu_memory_utilization "${VLLM_GPU_MEMORY_UTILIZATION}" \
     --max_model_len "${VLLM_MAX_MODEL_LEN}" --dtype bfloat16 --run-id "${RUN_TOKEN}" > "${VLLM_LOG}" 2>&1 &
 VLLM_PID=$!
@@ -396,7 +420,7 @@ run_logged() {
     return "${result}"
 }
 
-echo "Starting ${NUM_TRAIN_GPUS}-GPU DeepSpeed training on physical GPUs ${TRAIN_GPUS}"
+echo "Starting ${NUM_TRAIN_GPUS}-GPU policy training on physical GPUs ${TRAIN_GPUS}"
 run_logged "${OUTPUT_DIR}/logs/training.log" \
     env CUDA_VISIBLE_DEVICES="${TRAIN_GPUS}" ACCELERATE_LOG_LEVEL=info "${PYTHON}" -m accelerate.commands.launch \
     --config_file "${RESOLVED_ACCELERATE_CONFIG}" --main_process_port "${PORT}" \

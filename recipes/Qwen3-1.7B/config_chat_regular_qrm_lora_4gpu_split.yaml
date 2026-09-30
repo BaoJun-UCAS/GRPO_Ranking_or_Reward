@@ -3,7 +3,7 @@
 
 # Model arguments
 model_name_or_path: ${MODEL_NAME}
-model_revision: main
+model_revision: ${MODEL_REVISION}
 torch_dtype: bfloat16
 attn_implementation: flash_attention_2
 use_peft: true
@@ -21,6 +21,7 @@ lora_target_modules:
 
 # Data arguments
 dataset_name: ${DATASET_NAME}
+dataset_adapter: auto
 dataset_prompt_column: prompt
 dataset_train_split: train
 dataset_test_split: val
@@ -37,6 +38,7 @@ vllm_server_base_url: http://127.0.0.1:${VLLM_HTTP_PORT}
 vllm_group_port: ${VLLM_GROUP_PORT}
 vllm_server_timeout: 600
 advantage: studentization
+advantage_kwargs: {}
 token_broadcast: uniform
 loss_type: bnpo
 beta: 0.04
@@ -94,4 +96,4 @@ reward_data_save_path: ${OUTPUT_DIR}/reward_data
 do_eval: false
 eval_strategy: "no"
 eval_on_start: false
-per_device_eval_batch_size: 2
+per_device_eval_batch_size: 4

@@ -2,6 +2,97 @@
 
 这里区分两条流程：训练内 `trainer.evaluate()` 使用验证集和训练奖励；离线评测比较基础模型与训练模型在相同测试 prompt 上的回答，再交给独立 judge。两者不能互相替代，也不能把训练完成或 API 返回成功当作评测有效。
 
+## 2026-09-30 重构验收记录
+
+本机 GPU 4 / 5 / 6,7 分别用于 vLLM / QRM / 两 rank 策略训练。实际运行使用缓存的
+Qwen3-1.7B 与 QRM-Llama3.1-8B-v2，策略 revision 固定为
+`70d244cc86ccca08cf5af4e1e306ecf908b1ad5e`，QRM 固定为
+`23c6db70a35875248f45b3cfbe6d237ba8ac3e6d`。
+
+| `grpo_runs/` 下目录 | 已通过的实际检查 |
+| --- | --- |
+| `refactor-smoke-20260930` | ZeRO-2 + studentization；2 optimizer steps，2 个验证 prompt，adapter 保存，产物/timing 验收 |
+| `refactor-ddp-rank-smoke-20260930` | DDP + rank_reward(0.3)；2 optimizer steps，2 个验证 prompt，LoRA 合并、重载生成、产物验收 |
+| `refactor-full-length-smoke-v2-20260930` | 默认 2048/3072 prompt/completion 上限、8 次生成；2 optimizer steps + 2 个验证 prompt，最终代码验收 |
+
+每个目录保存 `run.env`、resolved YAML、代码快照、`train_results.json`、`eval_results.json`、
+`validation_report.json` 和日志；第二个目录还含 `reload_smoke.json` 与 `merged_model/`。
+
+默认长度首次运行在末尾验证暴露了 KV cache 与右侧 completion padding 的 FlashAttention 冲突。
+现已让评分 forward 显式关闭 cache，保存配置使用副本、不改变运行中的各 rank 模型；相同配置复跑通过。
+失败记录保留在 `refactor-full-length-smoke-20260930`，不能作为成功产物使用。
+
+这些都是功能 smoke：generation batch 为 16，未完成正式默认 batch 256 / 800 步训练。
+默认长度复跑实际最长训练 completion 为 1045 token，验证为 1737 token，因此没有覆盖每条都达到
+3072 token 的最坏显存情况，也不证明收敛或哪种 advantage 更好。两次短 smoke 的算法和 microbatch
+不同，不能用其 runtime 直接宣称 DDP 提速比例。运行结束后 4–7 卡已释放。
+
+## 2026-09-30 新 advantage 验证
+
+`robust_pairwise` 已按附件公式接入，原始 `studentization` 及其 `grpo` 别名保留。
+完整回归为 **300 passed，11 subtests passed**，包括附件三个数值例子、阈值边界、
+并列奖励、异常值、低精度与跨 rank 分组；真实 CPU LoRA 测试分别运行原始 GRPO 和新方法，
+检查权重更新、验证、保存与重载。4 条 warning 来自 DeepSpeed 的 Pydantic 弃用接口。
+
+真实四卡运行目录为 `grpo_runs/robust-pairwise-smoke-20260930`，使用上面的模型 revision
+及 GPU 布局，ZeRO-2、`delta=0.02`、`c=0.2`、8 次生成、generation batch 16、
+2048/3072 token 上限。已完成 2 optimizer steps 和 2 个验证 prompt，保存 adapter；
+`RUN_STATUS` 为 `success`，`validation_report.json` 为 `passed`，错误列表为空。
+两步梯度范数分别约为 0.1022、0.0309；验证 loss 约为 0.00145，指标有限。
+运行结束后 GPU 4–7 已释放。
+
+这是功能验证，未运行完整训练或证明质量优于原始 GRPO；`delta/c` 仍是未校准的示例值。
+两种方法的同配置切换命令见 [README](../README.md#改-advantage)。
+
+## 历史 800 步日志与初步参数（2026-09-30）
+
+参数参考来自 `grpo_runs/qwen3-1.7b-grpo-p2048-c3072-800step-20260928-193332`。
+按 rollout、rank 与 `rollout_index` 恢复同一 prompt 的完整 G=8 组，共 **204,800 条回答、
+25,600 组、716,800 个无序组内比较**；两 rank 的奖励向量没有重复。
+相同 prompt 文本跨 rollout 出现时仍分别计组，500 步 run 未混入本统计。
+重建结果与 `trainer_state.json` 的 800 条训练记录逐步对齐：奖励均值最大绝对误差
+`7.16e-8`，平均组内无偏标准差最大误差 `1.05e-8`。
+这验证的是奖励日志与训练标量一致；历史 `validation_report.json` 仍为 `failed`
+（缺少 `qrm_score` 推理日志），本统计不改写该验收状态。
+
+绝对奖励差 `|r_i-r_j|` 的 P20 / P50 / P90 分别为 **0.00915 / 0.02598 / 0.08410**。
+主推荐起点为 **`delta=0.01, c=0.08`**：约过滤最小的 22% 比较，保留约 70% 的线性幅度，
+在差值达到 `delta+c=0.09` 时封顶，覆盖约 9% 的比较。`c=0.05` 保留为下一组对照，
+用于检查较早封顶、较大 advantage 幅度的影响。它们均是待验证的实验参数，不是已证实的最优值。
+
+| `delta` | `c` | 死区 `d≤delta` | 线性区 | 饱和 `d≥delta+c` | 全零 advantage 组 |
+| --- | --- | --- | --- | --- | --- |
+| 0.02 | 0.20（原示例） | 40.49% | 58.33% | 1.18% | 0.97% |
+| 0.01 | 0.08（主推荐） | 21.74% | 69.50% | 8.76% | 0.32% |
+| 0.01 | 0.05（对照） | 21.74% | 59.85% | 18.41% | 0.32% |
+
+表中 `d=|r_i-r_j|`，比较比例以全部无序组内 pair 为分母，全零组比例以完整 prompt 组为分母。
+把 800 步分成四个连续的 200 步区间，主推荐的死区比例为 20.81%–22.31%，
+线性比例 69.16%–69.78%，饱和比例 8.36%–9.41%，全零组比例 0.17%–0.41%，
+说明这个分布起点在历史训练各阶段较稳定。
+
+这些阈值依赖当前 QRM、奖励权重与数据尺度。日志没有独立的评分误差标签，
+因此 `delta` 不是已校准的误差界；更换奖励模型或缩放奖励后应重新分析。
+新旧 advantage 幅度不同，不应按幅度比自动调整学习率，也不能将较小更新造成的变化归因于算法优势；
+对照实验需检查实际 KL 和独立评测，且新方法之后不能再做组内标准差归一化。
+
+初步配置保存于 [robust_pairwise_initial.env](../recipes/Qwen3-1.7B/robust_pairwise_initial.env)。
+在项目根目录、训练环境中使用：
+
+```bash
+source recipes/Qwen3-1.7B/robust_pairwise_initial.env
+python scripts/grpo.py train
+```
+
+复现历史统计无需加载模型或占用 GPU：
+
+```bash
+python scripts/analyze_advantage_rewards.py \
+  --run-dir grpo_runs/qwen3-1.7b-grpo-p2048-c3072-800step-20260928-193332
+```
+
+默认输出到该 run 的 `advantage_analysis/`，可用 `--output-dir` 指定其它目录。
+
 ## 训练运行验收
 
 训练进程正常退出后，先做不加载模型、不占 GPU 的产物与性能证据验收：
@@ -55,6 +146,11 @@ python scripts/plot_training_metrics.py /path/to/baseline /path/to/ranking \
 配置 `do_eval: true` 可以只在训练结束后验证，保留 `eval_strategy: "no"` 即不在训练中途执行；`steps`/`epoch` 策略则用于中途验证。现在两种方式都会正确传入验证数据集。
 
 全局验证 batch（训练进程数 × `per_device_eval_batch_size`）必须能被 `num_generations` 整除。例如 4 个训练进程、每卡验证 batch 2、8 次生成满足约束。开启验证会消耗 GPU，当前卡被占用时不要运行。
+
+四卡 launcher 可直接使用 `DO_EVAL=1 python scripts/grpo.py train`。
+默认两训练 rank、每卡 eval batch 4、8 次生成满足约束。调试可加 `MAX_EVAL_SAMPLES=8`。
+验证指标会同时返回给 Trainer callbacks 并写入 `eval_results.json`；开启 `do_eval` 后运行验收器
+要求该文件包含有限的 `eval_loss`、`eval_reward` 和正整数 `eval_samples`。
 
 奖励记录文件区分 `train`/`eval`，保留 optimizer step、micro-step、进程号并添加唯一 rollout 标识。因此同一次验证的多个 batch、同一步重复验证不会覆盖；原来的训练产物保持不动。
 

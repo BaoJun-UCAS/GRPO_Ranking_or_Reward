@@ -22,12 +22,11 @@ import re
 import os
 from functools import partial, update_wrapper
 from typing import Callable, Dict, Literal, Optional
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
 
 from latex2sympy2_extended import NormalizationConfig
 from math_verify import LatexExtractionConfig, parse, verify
 
+from .reward_client import get_remote_qrm_reward
 from .utils.code_providers import get_provider
 from .utils.competitive_programming import (
     SubtaskResult,
@@ -644,57 +643,6 @@ def get_soft_overlong_punishment(max_completion_len, soft_punish_cache):
         return rewards
 
     return soft_overlong_punishment_reward
-
-
-def get_remote_qrm_reward(server_url: str, timeout: int) -> Callable:
-    """Return a conversational reward callable backed by one QRM HTTP server."""
-
-    if not server_url or timeout <= 0:
-        raise ValueError("qrm_server requires reward_server_url and a positive reward_server_timeout")
-    endpoint = f"{server_url.rstrip('/')}/score/"
-
-    def qrm_server_reward(prompts, completions, **kwargs) -> list[float]:
-        if len(prompts) != len(completions):
-            raise ValueError("QRM request has different prompt and completion counts")
-        messages = []
-        for prompt, completion in zip(prompts, completions):
-            if not isinstance(prompt, list) or not isinstance(completion, list):
-                raise TypeError("qrm_server currently requires conversational prompts and completions")
-            messages.append(prompt + completion)
-
-        request = Request(
-            endpoint,
-            data=json.dumps({"messages": messages}, ensure_ascii=False).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        try:
-            with urlopen(request, timeout=timeout) as response:
-                result = json.load(response)
-        except HTTPError as error:
-            detail = error.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"QRM server returned HTTP {error.code}: {detail}") from error
-        except (json.JSONDecodeError, UnicodeDecodeError) as error:
-            raise RuntimeError(f"QRM server returned invalid JSON: {error}") from error
-        except (URLError, TimeoutError, OSError) as error:
-            raise RuntimeError(f"QRM server request failed: {error}") from error
-
-        rewards = result.get("rewards") if isinstance(result, dict) else None
-        if not isinstance(rewards, list) or len(rewards) != len(messages):
-            raise RuntimeError(
-                f"QRM server returned {len(rewards) if isinstance(rewards, list) else 'invalid'} "
-                f"rewards for {len(messages)} inputs"
-            )
-        try:
-            converted = [float(reward) for reward in rewards]
-        except (TypeError, ValueError) as error:
-            raise RuntimeError("QRM server returned a non-numeric reward") from error
-        if not all(math.isfinite(reward) for reward in converted):
-            raise RuntimeError("QRM server returned a non-finite reward")
-        return converted
-
-    qrm_server_reward.__name__ = "qrm_server"
-    return qrm_server_reward
 
 
 def get_reward_funcs(script_args) -> list[Callable]:

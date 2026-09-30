@@ -161,13 +161,19 @@ def download(args):
     # Import after configuring the cache: HF constants are resolved at import time.
     from huggingface_hub import snapshot_download
 
-    models = args.model or [os.environ.get("MODEL_NAME", DEFAULT_MODELS[0]), DEFAULT_MODELS[1]]
-    for model in dict.fromkeys(models):
+    if args.model:
+        requests = [(model, args.revision or "main") for model in args.model]
+    else:
+        requests = [
+            (os.environ.get("MODEL_NAME", DEFAULT_MODELS[0]), args.revision or os.environ.get("MODEL_REVISION", "main")),
+            (os.environ.get("QRM_MODEL", DEFAULT_MODELS[1]), args.revision or os.environ.get("QRM_REVISION", "main")),
+        ]
+    for model, revision in dict.fromkeys(requests):
         if Path(model).is_dir():
             print(f"Local model: {Path(model).resolve()}")
             continue
-        print(f"Downloading {model}@{args.revision} to {selected['HF_HUB_CACHE']}", flush=True)
-        location = snapshot_download(repo_id=model, revision=args.revision, cache_dir=str(selected["HF_HUB_CACHE"]))
+        print(f"Downloading {model}@{revision} to {selected['HF_HUB_CACHE']}", flush=True)
+        location = snapshot_download(repo_id=model, revision=revision, cache_dir=str(selected["HF_HUB_CACHE"]))
         print(f"Ready: {location}")
     return 0
 
@@ -244,7 +250,7 @@ def main(argv=None):
     subparsers.add_parser("cache", help="show downloaded blobs and partial files, without network access").set_defaults(func=cache)
     fetch = subparsers.add_parser("download", help="prefetch policy and reward models with HF progress bars")
     fetch.add_argument("--model", action="append", help="HF repo ID or local path; repeat for several models")
-    fetch.add_argument("--revision", default="main", help="revision for requested repositories; use a commit for repeatability")
+    fetch.add_argument("--revision", help="override revisions; defaults to MODEL_REVISION / QRM_REVISION or main")
     fetch.set_defaults(func=download)
     for name in ("smoke", "train"):
         run = subparsers.add_parser(name, help="two-step smoke defaults" if name == "smoke" else "run the training recipe")

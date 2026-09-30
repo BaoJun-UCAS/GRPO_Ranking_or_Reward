@@ -4,6 +4,10 @@ import asyncio
 import contextlib
 import io
 import json
+import os
+from pathlib import Path
+import subprocess
+import sys
 import threading
 import time
 import unittest
@@ -12,7 +16,7 @@ from unittest.mock import patch
 import httpx
 
 from open_r1.reward_server import build_length_aware_batches, create_app, parse_args
-from open_r1.rewards import get_remote_qrm_reward
+from open_r1.reward_client import get_remote_qrm_reward
 
 
 class FakeScorer:
@@ -90,6 +94,17 @@ class FakeResponse:
 
 
 class RewardClientTests(unittest.TestCase):
+    def test_client_imports_with_only_the_python_standard_library(self):
+        source_root = Path(__file__).resolve().parents[1] / "src"
+        result = subprocess.run(
+            [sys.executable, "-S", "-c",
+             "from open_r1.reward_client import get_remote_qrm_reward; "
+             "assert callable(get_remote_qrm_reward('http://localhost:8001', 30))"],
+            env={**os.environ, "PYTHONPATH": str(source_root)},
+            capture_output=True, text=True, timeout=15,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_client_combines_prompt_and_completion_without_loading_a_model(self):
         prompt = [[{"role": "user", "content": "question"}]]
         completion = [[{"role": "assistant", "content": "answer"}]]
@@ -101,7 +116,7 @@ class RewardClientTests(unittest.TestCase):
             captured["body"] = json.loads(request.data)
             return FakeResponse({"rewards": [1.25]})
 
-        with patch("open_r1.rewards.urlopen", side_effect=fake_urlopen):
+        with patch("open_r1.reward_client.urlopen", side_effect=fake_urlopen):
             reward = get_remote_qrm_reward("http://127.0.0.1:8001/", 30)
             self.assertEqual(reward(prompt, completion), [1.25])
 
@@ -109,8 +124,18 @@ class RewardClientTests(unittest.TestCase):
         self.assertEqual(captured["timeout"], 30)
         self.assertEqual(captured["body"]["messages"], [prompt[0] + completion[0]])
 
+    def test_raw_text_is_wrapped_without_changing_content(self):
+        with patch("open_r1.reward_client.urlopen", return_value=FakeResponse({"rewards": [1.25]})) as request:
+            reward = get_remote_qrm_reward("http://127.0.0.1:8001", 30)
+            self.assertEqual(reward(["raw prompt\n"], ["answer"]), [1.25])
+        self.assertEqual(json.loads(request.call_args.args[0].data)["messages"], [[
+            {"role": "user", "content": "raw prompt\n"}, {"role": "assistant", "content": "answer"},
+        ]])
+        with self.assertRaisesRegex(TypeError, "matching"):
+            reward(["prompt"], [[{"role": "assistant", "content": "answer"}]])
+
     def test_client_rejects_non_finite_rewards(self):
-        with patch("open_r1.rewards.urlopen", return_value=FakeResponse({"rewards": [float("nan")]})):
+        with patch("open_r1.reward_client.urlopen", return_value=FakeResponse({"rewards": [float("nan")]})):
             reward = get_remote_qrm_reward("http://127.0.0.1:8001", 30)
             with self.assertRaisesRegex(RuntimeError, "non-finite"):
                 reward([[{"role": "user", "content": "q"}]], [[{"role": "assistant", "content": "a"}]])

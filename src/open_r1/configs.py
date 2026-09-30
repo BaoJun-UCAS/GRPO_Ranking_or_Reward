@@ -14,7 +14,8 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
-from typing import Any, Literal, Optional
+import json
+from typing import Any, Literal, Optional, Union
 
 import trl
 
@@ -73,6 +74,16 @@ class ScriptArguments(trl.ScriptArguments):
     dataset_mixture: Optional[dict[str, Any]] = field(
         default=None,
         metadata={"help": "Configuration for creating dataset mixtures with advanced options like shuffling."},
+    )
+
+    dataset_adapter: str = field(
+        default="auto", metadata={"help": "Prompt adapter: auto, text, chat, raw, or module:function."},
+    )
+    max_train_samples: Optional[int] = field(
+        default=None, metadata={"help": "Limit raw training rows before prompt preparation (smoke/debug)."},
+    )
+    max_eval_samples: Optional[int] = field(
+        default=None, metadata={"help": "Limit validation rows before prompt preparation."},
     )
 
     def __post_init__(self):
@@ -136,6 +147,12 @@ class GRPOConfig(trl.GRPOConfig):
         metadata={"help": "The callbacks to run during training."},
     )
     chat_template: Optional[str] = field(default=None, metadata={"help": "The chat template to use."})
+    tokenizer_name_or_path: Optional[str] = field(
+        default=None, metadata={"help": "Tokenizer override; defaults to model_name_or_path."},
+    )
+    tokenizer_revision: Optional[str] = field(
+        default=None, metadata={"help": "Tokenizer revision; defaults to the model revision for the same repository."},
+    )
     hub_model_revision: Optional[str] = field(
         default="main", metadata={"help": "The Hub model branch to push the model to."}
     )
@@ -160,7 +177,18 @@ class GRPOConfig(trl.GRPOConfig):
     )
     advantage: str = field(
         default="studentization",
-        metadata={"help": "Method to compute advantages: 'ranking' or 'studentization'"}
+        metadata={"help": (
+            "Advantage registry name: studentization (alias grpo), robust_pairwise, ranking, "
+            "rank_reward, or module:function. robust_pairwise uses raw weighted reward differences "
+            "without group-std normalization; top-level scale_rewards does not change it."
+        )}
+    )
+    advantage_kwargs: Optional[Union[dict, str]] = field(
+        default=None, metadata={"help": (
+            "Selected advantage function options (YAML mapping or JSON). robust_pairwise takes "
+            "delta >= 0 and c > 0 in raw weighted reward units (defaults 0.02 and 0.2 are "
+            "uncalibrated examples). advantage_kwargs.delta is distinct from top-level PPO delta."
+        )},
     )
     token_broadcast: str = field(
         default="uniform",
@@ -201,6 +229,20 @@ class GRPOConfig(trl.GRPOConfig):
     )
 
 
+    def __post_init__(self):
+        if isinstance(self.advantage_kwargs, str):
+            self.advantage_kwargs = json.loads(self.advantage_kwargs)
+        if self.advantage_kwargs is not None and not isinstance(self.advantage_kwargs, dict):
+            raise ValueError("advantage_kwargs must be a YAML mapping or JSON object")
+        if self.token_broadcast not in {"uniform", "log_decay", "poly_decay", "loglog_decay"}:
+            raise ValueError(f"Unknown token_broadcast: {self.token_broadcast!r}")
+        if self.loss_type not in {"grpo", "bnpo", "dr_grpo"}:
+            raise ValueError(f"Unknown loss_type: {self.loss_type!r}")
+        if self.use_liger_loss and self.token_broadcast != "uniform":
+            raise ValueError("use_liger_loss only supports token_broadcast='uniform'")
+        super().__post_init__()
+
+
 @dataclass
 class SFTConfig(trl.SFTConfig):
     """
@@ -216,6 +258,12 @@ class SFTConfig(trl.SFTConfig):
         metadata={"help": "The callbacks to run during training."},
     )
     chat_template: Optional[str] = field(default=None, metadata={"help": "The chat template to use."})
+    tokenizer_name_or_path: Optional[str] = field(
+        default=None, metadata={"help": "Tokenizer override; defaults to model_name_or_path."},
+    )
+    tokenizer_revision: Optional[str] = field(
+        default=None, metadata={"help": "Tokenizer revision; defaults to the model revision for the same repository."},
+    )
     system_prompt: Optional[str] = field(
         default=None,
         metadata={"help": "The optional system prompt to use for benchmarking."},

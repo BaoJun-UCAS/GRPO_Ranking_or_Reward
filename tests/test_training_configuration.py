@@ -136,3 +136,26 @@ def test_completion_clipped_ratio_uses_global_batch(terminated, total, expected)
     })
     assert ratio == expected
     assert 0 <= ratio <= 1
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_completion_logging_controls_expensive_text_collectives(enabled):
+    # Execute the production logging block with observable collectives. This
+    # catches accidental all-gathers even when completion tables are disabled.
+    tree = ast.parse(SOURCE.read_text())
+    trainer = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "GRPOTrainer")
+    generate = next(node for node in trainer.body if isinstance(node, ast.FunctionDef) and node.name == "_generate_and_score_completions")
+    block = next(node for node in generate.body if isinstance(node, ast.If)
+                 and isinstance(node.test, ast.Attribute) and node.test.attr == "log_completions")
+    logs = {"prompt": [], "completion": [], "rewards": {}, "advantages": []}
+    gather = Mock(side_effect=lambda items: items)
+    mock_trainer = SimpleNamespace(log_completions=enabled, _textual_logs=logs,
+                                   _gather_python_objects=gather, reward_func_names=[])
+    namespace = {
+        "self": mock_trainer, "prompts_text": ["question"], "completions_text": ["answer"],
+        "all_process_advantages": SimpleNamespace(tolist=lambda: [1.0]),
+    }
+    exec(compile(ast.Module(body=[block], type_ignores=[]), str(SOURCE), "exec"), namespace)
+    assert gather.call_count == (2 if enabled else 0)
+    assert logs["prompt"] == (["question"] if enabled else [])
+    assert logs["advantages"] == ([1.0] if enabled else [])

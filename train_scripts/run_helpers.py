@@ -6,6 +6,7 @@ values are never expanded into the configuration.
 """
 
 import argparse
+import json
 import math
 import os
 from pathlib import Path
@@ -20,8 +21,60 @@ INTEGER_VARIABLES = {
     "MAX_PROMPT_LENGTH", "MAX_COMPLETION_LENGTH", "GENERATION_BATCH_SIZE", "GRADIENT_ACCUMULATION_STEPS",
     "MAX_STEPS", "NUM_GENERATIONS", "PER_DEVICE_TRAIN_BATCH_SIZE",
 }
-STRING_VARIABLES = {"RUN_NAME", "OUTPUT_DIR", "DATASET_NAME", "MODEL_NAME"}
+STRING_VARIABLES = {"RUN_NAME", "OUTPUT_DIR", "DATASET_NAME", "MODEL_NAME", "MODEL_REVISION"}
 PLACEHOLDER = re.compile(r"\$\{([A-Za-z_][A-Za-z_0-9]*)\}")
+
+
+# Optional overrides apply after parsing, preserving YAML strings and types.
+STRING_OVERRIDES = {
+    "ADVANTAGE": "advantage",
+    "DATASET_CONFIG": "dataset_config",
+    "DATASET_ADAPTER": "dataset_adapter",
+    "DATASET_PROMPT_COLUMN": "dataset_prompt_column",
+    "DATASET_TRAIN_SPLIT": "dataset_train_split",
+    "DATASET_TEST_SPLIT": "dataset_test_split",
+    "SYSTEM_PROMPT": "system_prompt",
+    "ATTN_IMPLEMENTATION": "attn_implementation",
+    "EVAL_STRATEGY": "eval_strategy",
+    "LOSS_TYPE": "loss_type",
+}
+INTEGER_OVERRIDES = {
+    "MAX_TRAIN_SAMPLES": "max_train_samples",
+    "MAX_EVAL_SAMPLES": "max_eval_samples",
+    "PER_DEVICE_EVAL_BATCH_SIZE": "per_device_eval_batch_size",
+    "EVAL_STEPS": "eval_steps",
+}
+BOOLEAN_OVERRIDES = {
+    "DO_EVAL": "do_eval",
+    "GRADIENT_CHECKPOINTING": "gradient_checkpointing",
+    "LOG_COMPLETIONS": "log_completions",
+    "SAVE_REWARD_DATA": "save_reward_data",
+}
+
+
+def apply_training_overrides(config, env):
+    for variable, field in STRING_OVERRIDES.items():
+        if variable in env:
+            config[field] = env[variable]
+    for variable, field in INTEGER_OVERRIDES.items():
+        if variable in env:
+            config[field] = positive_int(variable, env)
+    for variable, field in BOOLEAN_OVERRIDES.items():
+        if variable in env:
+            value = env[variable].lower()
+            if value not in ("0", "1", "false", "true"):
+                raise ValueError(f"{variable} must be 0, 1, false or true")
+            config[field] = value in ("1", "true")
+    if "ADVANTAGE_KWARGS" in env:
+        try:
+            options = json.loads(env["ADVANTAGE_KWARGS"])
+        except json.JSONDecodeError as error:
+            raise ValueError("ADVANTAGE_KWARGS must be a JSON object") from error
+        if not isinstance(options, dict):
+            raise ValueError("ADVANTAGE_KWARGS must be a JSON object")
+        config["advantage_kwargs"] = options
+    if config.get("eval_strategy", "no") not in ("no", "steps", "epoch"):
+        raise ValueError("EVAL_STRATEGY must be no, steps or epoch")
 
 
 def substitute(value, variables):
@@ -109,6 +162,10 @@ def resolve(config_path, accelerate_path, env):
         accelerate = yaml.safe_load(stream)
     if not isinstance(config, dict) or not isinstance(accelerate, dict):
         raise ValueError("Training and Accelerate YAML files must contain mappings")
+    apply_training_overrides(config, env)
+    # The policy service and trainer must load the same revision, even with
+    # a custom recipe. MODEL_REVISION controls both launch components.
+    config["model_revision"] = variables["MODEL_REVISION"]
     # A custom template must match the launch plan, so server and trainer cannot
     # silently load different models or write into unrelated directories.
     expected = {
@@ -136,8 +193,23 @@ def resolve(config_path, accelerate_path, env):
         raise ValueError("This split launcher requires reward_funcs: [qrm_server]")
     if accelerate.get("num_machines", 1) != 1:
         raise ValueError("This launcher supports a single machine; use a separate launcher for multi-node training")
-    if accelerate.get("distributed_type") != "DEEPSPEED":
-        raise ValueError("This launcher expects an Accelerate DEEPSPEED configuration")
+    if accelerate.get("distributed_type") not in ("DEEPSPEED", "MULTI_GPU"):
+        raise ValueError("This launcher expects an Accelerate DEEPSPEED or MULTI_GPU configuration")
+    if accelerate.get("distributed_type") == "MULTI_GPU":
+        if len(gpu_ids) < 2:
+            raise ValueError("MULTI_GPU requires at least two TRAIN_GPUS")
+        # LoRA's frozen backbone has no gradients. Avoid unused-parameter
+        # traversal, which also conflicts with reentrant checkpointing.
+        if config.get("use_peft"):
+            config.setdefault("ddp_find_unused_parameters", False)
+    evaluation_enabled = config.get("do_eval") or config.get("eval_strategy", "no") != "no"
+    if evaluation_enabled:
+        eval_batch = config.get("per_device_eval_batch_size", 8) * len(gpu_ids)
+        if eval_batch % variables["NUM_GENERATIONS"]:
+            raise ValueError(
+                "Evaluation requires PER_DEVICE_EVAL_BATCH_SIZE × training GPU count "
+                "to be divisible by NUM_GENERATIONS"
+            )
     if accelerate.get("machine_rank", 0) != 0:
         raise ValueError("Single-machine training requires machine_rank=0")
     if accelerate.get("use_cpu", False):

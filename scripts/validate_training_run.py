@@ -452,6 +452,18 @@ def validate_run(run_dir, allow_running=False, require_merged=False):
     )
     _validate_numeric_mapping(report, manifest, "run_manifest.json")
     _validate_numeric_mapping(report, train_results, "train_results.json", required=("train_loss",))
+    if config and config.get("do_eval"):
+        eval_results = _read_json(
+            report, _require_file(report, run_dir, "eval_results.json"), "eval_results.json"
+        )
+        _validate_numeric_mapping(
+            report, eval_results, "eval_results.json", required=("eval_loss", "eval_reward", "eval_samples")
+        )
+        if eval_results is not None:
+            samples = eval_results.get("eval_samples")
+            if not isinstance(samples, int) or isinstance(samples, bool) or samples < 1:
+                _add_error(report, "eval_results.json must contain positive integer eval_samples")
+            report["evaluation"] = eval_results
     training_log = _require_file(report, run_dir, "logs/training.log")
     qrm_log = _require_file(report, run_dir, "logs/qrm_server.log")
     _require_file(report, run_dir, "logs/vllm_server.log")

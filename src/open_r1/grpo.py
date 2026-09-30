@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import json
+from copy import deepcopy
 import logging
 import os
 import sys
@@ -30,61 +31,13 @@ from open_r1.configs import GRPOConfig, GRPOScriptArguments
 from open_r1.grpo_trainer import GRPOTrainer
 from open_r1.rewards import get_reward_funcs
 from open_r1.utils import get_dataset, get_model, get_tokenizer
+from open_r1.utils.data import prepare_grpo_dataset, truncate_conversation_prompt
 from open_r1.utils.callbacks import get_callbacks
 from open_r1.utils.wandb_logging import init_wandb_training
 from trl import ModelConfig, TrlParser, get_peft_config
-from trl.data_utils import maybe_apply_chat_template
 
 
 logger = logging.getLogger(__name__)
-
-
-def truncate_conversation_prompt(prompt, tokenizer, max_prompt_length):
-    """Left-truncate user content while keeping a valid chat template.
-
-    The returned structured prompt is shared by policy training, vLLM rollout,
-    and the external QRM, avoiding three different effective contexts.
-    """
-
-    if max_prompt_length is None:
-        return prompt
-
-    def rendered_length(messages):
-        rendered = maybe_apply_chat_template({"prompt": messages}, tokenizer)["prompt"]
-        return len(tokenizer(text=rendered, add_special_tokens=False)["input_ids"])
-
-    if rendered_length(prompt) <= max_prompt_length:
-        return prompt
-
-    user_index = next(
-        (index for index in range(len(prompt) - 1, -1, -1) if prompt[index]["role"] == "user"),
-        None,
-    )
-    if user_index is None:
-        raise ValueError("Cannot truncate an overlong conversational prompt without a user message")
-    content_ids = tokenizer.encode(prompt[user_index]["content"], add_special_tokens=False)
-    low, high = 0, len(content_ids)
-    best = None
-    while low <= high:
-        keep = (low + high) // 2
-        kept_ids = content_ids[-keep:] if keep else []
-        content = tokenizer.decode(
-            kept_ids,
-            skip_special_tokens=False,
-            clean_up_tokenization_spaces=False,
-        )
-        candidate = [dict(message) for message in prompt]
-        candidate[user_index]["content"] = content
-        if rendered_length(candidate) <= max_prompt_length:
-            best = candidate
-            low = keep + 1
-        else:
-            high = keep - 1
-    if best is None:
-        raise ValueError(
-            f"Chat-template overhead exceeds max_prompt_length={max_prompt_length}; increase the configured limit"
-        )
-    return best
 
 
 def _redact_secrets(value):
@@ -195,6 +148,7 @@ def main(script_args, training_args, model_args):
     # Load tokenizer
     ################
     tokenizer = get_tokenizer(model_args, training_args)
+    dataset = prepare_grpo_dataset(dataset, script_args, training_args, tokenizer)
 
     ##############
     # Load model #
@@ -205,29 +159,12 @@ def main(script_args, training_args, model_args):
     # Get reward functions from the registry
     reward_funcs = get_reward_funcs(script_args)
 
-    # Format into conversation
-    def make_conversation(example, prompt_column: str = script_args.dataset_prompt_column):
-        prompt = []
-
-        if training_args.system_prompt is not None:
-            prompt.append({"role": "system", "content": training_args.system_prompt})
-
-        if prompt_column not in example:
-            raise ValueError(f"Dataset Question Field Error: {prompt_column} is not supported.")
-
-        prompt.append({"role": "user", "content": example[prompt_column]})
-        prompt = truncate_conversation_prompt(prompt, tokenizer, training_args.max_prompt_length)
-        return {"prompt": prompt}
-
-    dataset = dataset.map(make_conversation)
-
-    for split in dataset:
-        if "messages" in dataset[split].column_names:
-            dataset[split] = dataset[split].remove_columns("messages")
-
     #############################
     # Initialize the GRPO trainer
     #############################
+    peft_config = get_peft_config(model_args)
+    if peft_config is not None:
+        peft_config.revision = model_args.model_revision
     trainer = GRPOTrainer(
         model=model,
         reward_funcs=reward_funcs,
@@ -238,7 +175,7 @@ def main(script_args, training_args, model_args):
             if training_args.do_eval or training_args.eval_strategy != "no"
             else None
         ),
-        peft_config=get_peft_config(model_args),
+        peft_config=peft_config,
         callbacks=get_callbacks(training_args, model_args),
         processing_class=tokenizer,
     )
@@ -278,9 +215,11 @@ def main(script_args, training_args, model_args):
     }
     if trainer.accelerator.is_main_process:
         trainer.create_model_card(**kwargs)
-        # Restore k,v cache for fast inference
-        trainer.model.config.use_cache = True
-        trainer.model.config.save_pretrained(training_args.output_dir)
+        # Save an inference-friendly config without mutating the live policy
+        # before evaluation (or making rank 0 differ from the other ranks).
+        inference_config = deepcopy(trainer.model.config)
+        inference_config.use_cache = True
+        inference_config.save_pretrained(training_args.output_dir)
 
     ##########
     # Evaluate

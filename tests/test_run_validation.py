@@ -159,3 +159,19 @@ def test_non_peft_run_requires_full_model_weights(tmp_path):
     assert any("full-model weights" in error for error in report["errors"])
     (run / "model.safetensors").write_bytes(b"fake-full-model")
     assert VALIDATION.validate_run(run)["status"] == "passed"
+
+
+def test_final_evaluation_requires_finite_reward_artifact(tmp_path):
+    run = create_run(tmp_path / "run")
+    config_path = run / "config/resolved_training_config.yaml"
+    config = yaml.safe_load(config_path.read_text())
+    config["do_eval"] = True
+    config_path.write_text(yaml.safe_dump(config))
+    assert VALIDATION.validate_run(run)["status"] == "failed"
+    results = run / "eval_results.json"
+    results.write_text(json.dumps({"eval_loss": 0.1, "eval_samples": 2}))
+    assert VALIDATION.validate_run(run)["status"] == "failed"
+    results.write_text(json.dumps({"eval_loss": 0.1, "eval_reward": 1.5, "eval_samples": 2}))
+    report = VALIDATION.validate_run(run)
+    assert report["status"] == "passed"
+    assert report["evaluation"]["eval_reward"] == 1.5
