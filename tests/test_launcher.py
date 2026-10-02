@@ -28,12 +28,12 @@ def launch_env(tmp_path):
         "HF_USERNAME", "HF_HOME", "HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE", "HF_DATASETS_CACHE",
         "GRPO_CACHE_ROOT", "RUN_DIR", "GENERATION_BATCH_SIZE", "CONFIG_FILE", "ACCELERATE_CONFIG",
         "RESUME_FROM_CHECKPOINT", "CUDA_VISIBLE_DEVICES", "VLLM_PORT", "VLLM_HTTP_PORT", "VLLM_GPUS",
-        "VLLM_GPU", "QRM_GPU", "QRM_HTTP_PORT", "QRM_MODEL", "QRM_MAX_BATCH_TOKENS",
+        "VLLM_GPU", "VLLM_MAX_NUM_SEQS", "QRM_GPU", "QRM_HTTP_PORT", "QRM_MODEL", "QRM_MAX_BATCH_TOKENS",
         "MODEL_REVISION", "ADVANTAGE", "ADVANTAGE_KWARGS", "DATASET_CONFIG", "DATASET_ADAPTER",
         "DATASET_PROMPT_COLUMN", "DATASET_TRAIN_SPLIT", "DATASET_TEST_SPLIT", "SYSTEM_PROMPT",
         "DO_EVAL", "EVAL_STRATEGY", "EVAL_STEPS", "MAX_TRAIN_SAMPLES", "MAX_EVAL_SAMPLES",
         "PER_DEVICE_EVAL_BATCH_SIZE", "ATTN_IMPLEMENTATION", "LOSS_TYPE", "GRADIENT_CHECKPOINTING",
-        "LOG_COMPLETIONS", "SAVE_REWARD_DATA",
+        "LOG_COMPLETIONS", "SAVE_REWARD_DATA", "OVERLAP_QRM_REFERENCE",
     ):
         env.pop(name, None)
     env.update(
@@ -113,6 +113,8 @@ def test_dry_run_resolves_four_gpu_split(launch_env, tmp_path):
     assert "QRM batching: max examples=4; padded-token budget=6144; max length=6144" in result.stdout
     assert "use_cpu_object_collectives: true" in result.stdout
     assert "trim_unused_padding: true" in result.stdout
+    assert "overlap_qrm_reference: true" in result.stdout
+    assert "disable_dropout: true" in result.stdout
     assert "profile_stage_timings: true" in result.stdout
     assert not (tmp_path / "runs").exists()
 
@@ -138,6 +140,7 @@ def test_legacy_singular_gpu_variable_is_rejected(launch_env, tmp_path):
         ({"QRM_HTTP_PORT": "8123"}, "distinct ports"),
         ({"VLLM_GROUP_PORT": "8123"}, "distinct ports"),
         ({"VLLM_MAX_MODEL_LEN": "512"}, "must cover"),
+        ({"VLLM_MAX_NUM_SEQS": "0"}, "must be a positive integer"),
         ({"VLLM_USE_V1": "1"}, "requires VLLM_USE_V1=0"),
         ({"QRM_MAX_BATCH_TOKENS": "0"}, "must be a positive integer"),
         ({"QRM_MAX_BATCH_TOKENS": "512"}, "must be at least QRM_MAX_LENGTH"),
@@ -359,6 +362,7 @@ def test_training_exit_preserves_status_and_reaps_workers(fake_runtime, train_ex
     env, state = fake_runtime
     env["FAKE_TRAIN_EXIT"] = str(train_exit)
     env["MODEL_REVISION"] = "pinned-policy-commit"
+    env["VLLM_MAX_NUM_SEQS"] = "128"
     result = run_launcher(env)
     assert result.returncode == train_exit, result.stdout
     qrm = json.loads((state / "qrm.json").read_text())
@@ -372,6 +376,9 @@ def test_training_exit_preserves_status_and_reaps_workers(fake_runtime, train_ex
     assert qrm["args"][qrm["args"].index("--batch-size") + 1] == "2"
     server = json.loads((state / "server.json").read_text())
     assert server["args"][server["args"].index("--revision") + 1] == "pinned-policy-commit"
+    assert server["args"][server["args"].index("--max_num_seqs") + 1] == "128"
+    assert "max concurrent sequences=128" in result.stdout
+    assert "VLLM_MAX_NUM_SEQS=128" in (run / "run.env").read_text()
     config = yaml.safe_load((run / "config/resolved_training_config.yaml").read_text())
     assert config["model_revision"] == "pinned-policy-commit"
     assert qrm["args"][qrm["args"].index("--model") + 1] == env.get("QRM_MODEL", "friendshipkim/QRM-Llama3.1-8B-v2")
@@ -532,7 +539,7 @@ def test_optional_overrides_preserve_types_and_reach_custom_recipe(launch_env, t
         DATASET_ADAPTER="chat", DATASET_PROMPT_COLUMN="messages", DATASET_CONFIG="subset: #1",
         DATASET_TRAIN_SPLIT="train[:10%]", DATASET_TEST_SPLIT="validation",
         DO_EVAL="true", MAX_TRAIN_SAMPLES="16", MAX_EVAL_SAMPLES="8", EVAL_STEPS="3",
-        SYSTEM_PROMPT="A prompt: # not a comment", GRADIENT_CHECKPOINTING="0",
+        SYSTEM_PROMPT="A prompt: # not a comment", GRADIENT_CHECKPOINTING="0", OVERLAP_QRM_REFERENCE="0",
     )
     result = run_launcher(launch_env, "--dry-run")
     assert result.returncode == 0, result.stdout
@@ -547,6 +554,7 @@ def test_optional_overrides_preserve_types_and_reach_custom_recipe(launch_env, t
     assert config["dataset_test_split"] == "validation"
     assert config["do_eval"] is True
     assert config["gradient_checkpointing"] is False
+    assert config["overlap_qrm_reference"] is False
     assert config["max_train_samples"] == 16
     assert config["max_eval_samples"] == 8
     assert config["system_prompt"] == "A prompt: # not a comment"

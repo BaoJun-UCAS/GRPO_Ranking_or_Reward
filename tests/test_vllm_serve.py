@@ -16,11 +16,11 @@ import threading
 import time
 import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import httpx
 
-from open_r1.vllm_serve import create_app, parse_args
+from open_r1.vllm_serve import create_app, main, parse_args
 
 
 class FakeDtype:
@@ -35,6 +35,7 @@ class FakeSamplingParams:
 class FakeEngine:
     def __init__(self):
         self.calls = []
+        self.generation_requests = []
         self.block_method = None
         self.fail_method = None
         self.entered = threading.Event()
@@ -52,8 +53,9 @@ class FakeEngine:
     def collective_rpc(self, method, args=()):
         self._record(method)
 
-    def generate(self, prompts, sampling_params):
+    def generate(self, prompts, sampling_params, *, use_tqdm=True):
         self._record("generate")
+        self.generation_requests.append((prompts, sampling_params, use_tqdm))
         return [
             types.SimpleNamespace(
                 outputs=[types.SimpleNamespace(token_ids=(index, n)) for n in range(sampling_params.n)]
@@ -111,6 +113,34 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         response = await self.client.post("/generate/", json={"prompts": ["one", "two"], "n": 2})
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"completion_ids": [[0, 0], [0, 1], [1, 0], [1, 1]]})
+
+    async def test_token_only_generation_preserves_sampling_and_guided_regex(self):
+        response = await self.client.post("/generate/", json={
+            "prompts": ["answer"], "n": 3, "max_tokens": 17,
+            "temperature": 0.8, "top_p": 0.7, "top_k": 4, "min_p": 0.02,
+            "repetition_penalty": 1.1, "guided_decoding_regex": "[ab]+",
+        })
+        self.assertEqual(response.status_code, 200)
+        prompts, params, use_tqdm = self.engine.generation_requests[-1]
+        self.assertEqual(prompts, ["answer"])
+        self.assertFalse(use_tqdm)
+        self.assertIs(params.detokenize, False)
+        self.assertEqual((params.n, params.max_tokens), (3, 17))
+        self.assertEqual((params.temperature, params.top_p, params.top_k, params.min_p), (0.8, 0.7, 4, 0.02))
+        self.assertEqual(params.repetition_penalty, 1.1)
+        self.assertEqual((params.guided_decoding.backend, params.guided_decoding.regex), ("outlines", "[ab]+"))
+        # Keep vLLM's default EOS stopping; token-only output must not set
+        # ignore_eos or add a text stop condition that requires detokenization.
+        self.assertNotIn("ignore_eos", vars(params))
+        self.assertNotIn("stop", vars(params))
+
+    async def test_token_only_response_preserves_terminal_token_ids(self):
+        # The trainer needs terminal EOS IDs to construct completion masks.
+        result = [types.SimpleNamespace(outputs=[types.SimpleNamespace(token_ids=(11, 7, 2))])]
+        with patch.object(self.engine, "generate", return_value=result):
+            response = await self.client.post("/generate/", json={"prompts": ["question"]})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"completion_ids": [[11, 7, 2]]})
 
     async def test_init_ack_precedes_nccl_completion_and_health_stays_responsive(self):
         self.engine.block_method = "init_communicator"
@@ -219,12 +249,35 @@ class ConfigurationTests(unittest.TestCase):
         for option, value in (
             ("--port", "0"), ("--port", "65536"), ("--tensor_parallel_size", "0"),
             ("--gpu_memory_utilization", "0"), ("--gpu_memory_utilization", "nan"),
-            ("--max_model_len", "0"), ("--shutdown_timeout", "inf"),
+            ("--max_model_len", "0"), ("--max_num_seqs", "0"), ("--max_num_seqs", "-1"),
+            ("--shutdown_timeout", "inf"),
         ):
             with self.subTest(option=option, value=value), contextlib.redirect_stderr(io.StringIO()):
                 with self.assertRaises(SystemExit) as raised:
                     parse_args(["--model", "test", option, value])
                 self.assertEqual(raised.exception.code, 2)
+
+    def test_sequence_limit_is_optional_and_reaches_engine(self):
+        self.assertIsNone(parse_args(["--model", "test"]).max_num_seqs)
+        self.assertEqual(parse_args(["--model", "test", "--max_num_seqs", "64"]).max_num_seqs, 64)
+        for limit in (None, 64):
+            with self.subTest(limit=limit):
+                fake_vllm = types.ModuleType("vllm")
+                fake_vllm.LLM = Mock()
+                fake_uvicorn = types.ModuleType("uvicorn")
+                fake_uvicorn.run = Mock()
+                argv = ["serve", "--model", "test"]
+                if limit is not None:
+                    argv.extend(["--max_num_seqs", str(limit)])
+                with (
+                    patch.dict(sys.modules, {"vllm": fake_vllm, "uvicorn": fake_uvicorn}),
+                    patch.dict(os.environ, {"VLLM_PORT": "", "VLLM_USE_V1": "0", "VLLM_WORKER_MULTIPROC_METHOD": "spawn"}),
+                    patch.object(sys, "argv", argv),
+                    patch("open_r1.vllm_serve.create_app", return_value=object()),
+                ):
+                    main()
+                self.assertEqual(fake_vllm.LLM.call_args.kwargs["max_num_seqs"], limit)
+                fake_uvicorn.run.assert_called_once()
 
     def test_import_and_help_do_not_import_cuda_libraries(self):
         program = (

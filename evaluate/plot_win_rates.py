@@ -24,13 +24,17 @@ def load_win_rate_data(path):
     config = payload["bootstrap_config"]
     result = {f"model{i}_name": parse_model_name(config[f"model{i}_path"]) for i in (1, 2)}
     observed = (payload.get("validation") or {}).get("observed", {})
+    paired = config.get("judge_both_orders", False)
+    result["metric_label"] = "paired-order score" if paired else "win rate"
     for metric in ("survey", "overall"):
         analysis = payload["bootstrap_analysis"][f"{metric}_winner_analysis"]
         if analysis["iterations_with_valid_comparisons"] < 1:
             raise ValueError(f"No valid {metric} comparisons in {path}")
         for model in (1, 2):
-            stats = analysis[f"model{model}_win_rate_distribution"]
-            mean = observed.get(f"{metric}_analysis", {}).get(f"model{model}_win_rate", stats["mean"])
+            distribution = "score" if paired else "win_rate"
+            observed_key = "mean_score" if paired else "win_rate"
+            stats = analysis[f"model{model}_{distribution}_distribution"]
+            mean = observed.get(f"{metric}_analysis", {}).get(f"model{model}_{observed_key}", stats["mean"])
             values = [mean, *stats["ci_95"]]
             if any(not isinstance(v, (int, float)) or not math.isfinite(v) or not 0 <= v <= 1 for v in values):
                 raise ValueError(f"Invalid statistics in {path}")
@@ -58,7 +62,9 @@ def main():
             ax.vlines(i - 1, low, high, color="black")
         ax.set_xticks([0, 1], ["Model 1", "Model 2"])
         ax.set_ylim(0, 1)
-        ax.set_title(metric.title() + " win rate (95% bootstrap CI)")
+        ax.set_title(metric.title() + " " + data["metric_label"] + " (95% CI)")
+        if data["metric_label"] == "paired-order score":
+            ax.axhline(0.5, color="gray", linestyle="--", linewidth=1)
     fig.tight_layout()
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(args.output)

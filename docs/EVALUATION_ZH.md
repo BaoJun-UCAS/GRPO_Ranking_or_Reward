@@ -93,6 +93,98 @@ python scripts/analyze_advantage_rewards.py \
 
 默认输出到该 run 的 `advantage_analysis/`，可用 `--output-dir` 指定其它目录。
 
+## 四卡吞吐优化与对照（2026-09-30）
+
+本次比较以提交 `1900863` 为旧代码基准，使用四张 RTX 4090：GPU 4 运行 vLLM、GPU 5
+运行 QRM、GPU 6–7 运行 ZeRO-2 策略训练。固定 Qwen3-1.7B revision
+`70d244cc86ccca08cf5af4e1e306ecf908b1ad5e`、QRM revision
+`23c6db70a35875248f45b3cfbe6d237ba8ac3e6d`，以及本机预处理 UltraChat 数据。
+两侧均为 4 optimizer steps、128 条训练 prompt、2 条末尾验证 prompt；generation batch 256、
+每卡 micro-batch 1、accumulation 128、每组 8 个回答、prompt/completion 上限 2048/3072，
+`robust_pairwise(delta=0.01,c=0.08)`、BNPO、`beta=0.04`。没有通过缩短回答上限或改变全局 batch 提速。
+
+旧、新运行目录分别为 `grpo_runs/four-gpu-before-20260930` 和
+`grpo_runs/four-gpu-after-v2-20260930`，均完成 4 step、末尾验证、adapter 保存和产物验收，
+`RUN_STATUS=success`、`validation_report.json` 为 `passed`。
+
+| 指标 | 旧代码 | 优化后 |
+| --- | ---: | ---: |
+| Trainer 总训练耗时，不含服务启动与末尾验证 | 494.72 s | 448.13 s |
+| 第 2–4 步平均耗时，取每步较慢 rank | 121.52 s | 109.19 s |
+| 第 2–4 步策略阶段平均耗时，rank 0 | 35.89 s | 27.24 s |
+| 4 步生成 completion token 数 | 892,795 | 892,442 |
+| completion token / 总训练秒数 | 1804.65 | 1991.47 |
+
+本次总耗时减少 **9.42%**，completion 吞吐增加 **10.35%**；排除第一步后，
+每步耗时减少 **10.14%**。采样轨迹不同，但总 completion token 数仅相差约 0.04%。
+每步约 5.2 s 的参考计算被 QRM 评分覆盖；GPU 采样也观察到 GPU 5、6、7 同时计算。
+阶段分解、逐步 CSV、原始测试结果及重建脚本见
+`results/four_gpu_optimization_20260930/{comparison.json,step_metrics.csv,stage_comparison.png,tests.log,compare_runs.py}`。
+
+首次候选 `four-gpu-after-20260930` 因原配置未显式设置 `disable_dropout` 而触发串行保护，
+已主动停止并保留失败记录，不计入上述对照。补齐配置后使用新的 v2 目录完整重跑。
+
+主要改动是批量传输 completion token/长度、批量读取小型 loss 指标、温度为 1 时省去整张
+logits 的除法，以及关闭 vLLM 接口不使用的 detokenization。四卡 recipe 还开启
+`overlap_qrm_reference`：同一批回答交给 QRM 时，两张训练卡先计算参考概率，策略更新直接使用缓存。
+缓存与回答一起 shuffle、split、trim，不跨策略更新提前生成下一批样本。
+
+`timing/reference_precompute_*` 与 `timing/qrm_service_*` 是重叠区间；
+`timing/qrm_total_*` 包含联合等待，**不能再将 reference 时间加到该区间或总 step 时间上**。
+阶段比较使用同一个 rank 的指标，不能把不同 rank 各自的最大值相加。
+
+局部对照支持保留原来的服务批量设置：
+
+| 对照 | 测量结果 | 决策 |
+| --- | --- | --- |
+| completion 转 CPU，形状 128×3072，3 次中位数 | 旧循环 4.7998 s；批量传输 0.00564 s，输出一致 | 使用批量传输；这是局部操作的收益 |
+| QRM batch 上限 4 / 8，同一 256 回答，每档预热 1 次、测 3 次 | 中位数 30.5960 / 30.7880 s | 保留 4 |
+| vLLM 并发上限 256 / 128 / 64，同一 engine、固定 KV 分配，每档 1 次 | 4708 / 4162 / 3288 completion token/s；均无抢占 | 保留 256，并开放 `VLLM_MAX_NUM_SEQS` |
+
+QRM batch 8 相对 batch 4 的奖励最大/平均绝对差为 0.009056/0.002109；
+这是 BF16 批处理形状带来的数值差异，不能用作 `delta` 的评分噪声校准。
+vLLM 各档输出轨迹和长度不同；这项单轮比较也不是不同独立部署的精确加速倍数，
+不同部署的 CUDA graph 与 KV 分配可能变化。长回答频繁抢占时仍需按实际数据重新测量。
+
+通用 `GRPOConfig` 默认不启用 overlap，四卡 recipe 默认启用且显式设置 `disable_dropout: true`。
+当前参考模型限定为 dense Qwen2/Qwen3、默认 RoPE、无 dropout，并要求 micro-batch 1、
+padding 裁剪、单次迭代及 optimizer step 对齐；不满足条件时自动退回串行。
+当前 Qwen3 的 attention dropout 和 LoRA dropout 原本均为 0，因此显式禁用 dropout 不改变本次目标。
+更换其它模型、动态 RoPE 或训练方式后，应先检查启动提示及 reference 计时，确认实际执行路径。
+
+全套 CPU 回归为 **394 passed，15 subtests passed**，包含真实 tiny Qwen2 + 非零 LoRA 的
+cached/uncached loss 与梯度比较、变长和全屏蔽回答、adapter 异常恢复、并发线程异常和配置回退。
+短训练验证功能与吞吐，不证明 800 step 的稳定加速比例、模型收敛或质量提升。
+
+在 `grpo` 环境、项目根目录使用下列命令开始完整训练，并在完成后验收；默认四卡 recipe 已开启优化。
+`OVERLAP_QRM_REFERENCE=0` 可单独关闭参考概率并行，保留其它低开销优化。
+
+```bash
+export CUDA_HOME="$CONDA_PREFIX"
+export DATASET_NAME=/data/baojun/datasets/ultrachat_200k_grpo_seed42
+export VLLM_GPUS=4 QRM_GPU=5 TRAIN_GPUS=6,7
+export MODEL_REVISION=70d244cc86ccca08cf5af4e1e306ecf908b1ad5e
+export QRM_REVISION=23c6db70a35875248f45b3cfbe6d237ba8ac3e6d
+source recipes/Qwen3-1.7B/robust_pairwise_initial.env
+RUN_NAME=robust-pairwise-fast MAX_STEPS=800 DO_EVAL=1 python scripts/grpo.py train
+python scripts/grpo.py validate --run-dir grpo_runs/robust-pairwise-fast --require-merged
+```
+
+局部原始证据与重建脚本保存在本机 `results/four_gpu_optimization_20260930/`；运行产物和
+该结果目录均不纳入 Git。以下命令可在训练服务退出、对应 GPU 空闲后重做服务对照，输出文件不能已存在：
+
+```bash
+export HF_HOME=/data/baojun/cache/grpo/huggingface
+CUDA_VISIBLE_DEVICES=5 python scripts/benchmark_reward_batches.py \
+  --run-dir grpo_runs/four-gpu-before-20260930 --step 0 \
+  --revision 23c6db70a35875248f45b3cfbe6d237ba8ac3e6d \
+  --batch-sizes 4 8 --warmup 1 --repeats 3 --output /tmp/qrm-batch-new.json
+CUDA_VISIBLE_DEVICES=4 python scripts/benchmark_vllm_scheduler.py \
+  --run-dir grpo_runs/four-gpu-before-20260930 \
+  --revision 70d244cc86ccca08cf5af4e1e306ecf908b1ad5e \
+  --caps 256 128 64 --output /tmp/vllm-scheduler-new.json
+```
+
 ## 训练运行验收
 
 训练进程正常退出后，先做不加载模型、不占 GPU 的产物与性能证据验收：

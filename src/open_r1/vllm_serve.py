@@ -213,10 +213,15 @@ def create_app(llm: "LLM", tensor_parallel_size: int, shutdown_timeout: float = 
                 min_p=request.min_p,
                 max_tokens=request.max_tokens,
                 guided_decoding=guided_decoding,
+                # This API returns only token IDs. EOS/length stopping and
+                # Outlines' token-based regex FSM do not need output text.
+                detokenize=False,
             )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        outputs = await wait_for(submit(llm.generate, prompts=request.prompts, sampling_params=sampling_params))
+        outputs = await wait_for(submit(
+            llm.generate, prompts=request.prompts, sampling_params=sampling_params, use_tqdm=False
+        ))
         completion_ids = [list(output.token_ids) for result in outputs for output in result.outputs]
         return {"completion_ids": completion_ids}
 
@@ -278,6 +283,10 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--tensor_parallel_size", type=int, default=1)
     parser.add_argument("--gpu_memory_utilization", type=float, default=0.9)
     parser.add_argument("--max_model_len", type=int)
+    parser.add_argument(
+        "--max_num_seqs", type=int, default=None,
+        help="Maximum concurrent sequences; unset preserves the installed vLLM default.",
+    )
     parser.add_argument("--dtype", default="auto")
     parser.add_argument("--kv_cache_dtype", default="auto")
     parser.add_argument("--enable_prefix_caching", action=argparse.BooleanOptionalAction, default=None)
@@ -294,6 +303,8 @@ def parse_args(argv=None) -> argparse.Namespace:
         parser.error("--gpu_memory_utilization must be greater than 0 and at most 1")
     if args.max_model_len is not None and args.max_model_len < 1:
         parser.error("--max_model_len must be positive")
+    if args.max_num_seqs is not None and args.max_num_seqs < 1:
+        parser.error("--max_num_seqs must be positive")
     if not 0 < args.shutdown_timeout < float("inf"):
         parser.error("--shutdown_timeout must be finite and positive")
     return args
@@ -322,6 +333,7 @@ def main() -> None:
         tensor_parallel_size=args.tensor_parallel_size,
         gpu_memory_utilization=args.gpu_memory_utilization,
         max_model_len=args.max_model_len,
+        max_num_seqs=args.max_num_seqs,
         dtype=args.dtype,
         kv_cache_dtype=args.kv_cache_dtype,
         enable_prefix_caching=args.enable_prefix_caching,

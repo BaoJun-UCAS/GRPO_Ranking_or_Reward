@@ -49,6 +49,7 @@ BOOLEAN_OVERRIDES = {
     "GRADIENT_CHECKPOINTING": "gradient_checkpointing",
     "LOG_COMPLETIONS": "log_completions",
     "SAVE_REWARD_DATA": "save_reward_data",
+    "OVERLAP_QRM_REFERENCE": "overlap_qrm_reference",
 }
 
 
@@ -120,6 +121,8 @@ def resolve(config_path, accelerate_path, env):
     vllm_gpu_ids = [int(item) for item in vllm_gpu_text.split(",")]
     qrm_gpu_id = int(qrm_gpu_text)
     qrm_max_length = positive_int("QRM_MAX_LENGTH", env)
+    if "VLLM_MAX_NUM_SEQS" in env:
+        positive_int("VLLM_MAX_NUM_SEQS", env)
     positive_int("REWARD_BATCH_SIZE", env)
     if variables["QRM_MAX_BATCH_TOKENS"] < qrm_max_length:
         raise ValueError("QRM_MAX_BATCH_TOKENS must be at least QRM_MAX_LENGTH")
@@ -268,6 +271,7 @@ def main():
             print(f"Plan: vLLM GPUs {os.environ['VLLM_GPUS']} (TP={os.environ['NUM_VLLM_GPUS']}); "
                   f"QRM GPU {os.environ['QRM_GPU']}; training GPUs {os.environ['TRAIN_GPUS']}")
             print(f"Training processes: {accelerate['num_processes']}; generation batch: {config['generation_batch_size']}")
+            print(f"vLLM scheduling: max concurrent sequences={os.environ.get('VLLM_MAX_NUM_SEQS', 'vLLM default')}")
             print(f"Ports: vLLM HTTP={os.environ['VLLM_HTTP_PORT']}, QRM HTTP={os.environ['QRM_HTTP_PORT']}, "
                   f"training={os.environ['PORT']}, weight sync={os.environ['VLLM_GROUP_PORT']}")
             print(f"QRM batching: max examples={os.environ['REWARD_BATCH_SIZE']}; "

@@ -2,9 +2,9 @@
 """
 Bootstrap-based LLM-as-judge evaluation with percentile confidence intervals.
 
-This script sends N unique response pairs to the judge once, then constructs confidence
-intervals by resampling those N judgments locally with replacement. This keeps the API
-cost at N judge calls (excluding retries), independent of the bootstrap count B.
+This script judges N response pairs once, or twice in opposite presentation orders
+with --judge-both-orders. Confidence intervals resample N prompt clusters locally,
+keeping API calls at N or 2N before cache/retries, independent of bootstrap count B.
 
 The output contains all low-level details from each bootstrap iteration plus statistical
 analysis including confidence intervals for win rates.
@@ -17,6 +17,11 @@ import hashlib
 import re
 import random
 import time
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from open_r1.evaluation import combine_order_judgments
 from typing import List, Dict, Any, Optional, Tuple
 from tqdm import tqdm
 
@@ -122,7 +127,7 @@ def merge_completions_artifacts(meta1: Dict[str, Any], items1: List[Dict[str, st
     if contract1 and contract2:
         for field in ("version", "dataset", "prompts_sha256", "system_prompt", "enable_thinking",
                       "max_prompt_length", "max_new_tokens", "temperature", "top_p", "seed",
-                      "n_completions", "backend"):
+                      "n_completions", "backend", "tokens_sha256", "frozen_prompts", "versions"):
             if contract1.get(field) != contract2.get(field):
                 raise ValueError(f"Evaluation contract mismatch: {field}")
 
@@ -710,114 +715,45 @@ def calculate_majority_vote(individual_judgments: List[Dict[str, Any]]) -> Dict[
 
 
 def analyze_bootstrap_results(bootstrap_results: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Analyze bootstrap results to calculate win rate distributions and confidence intervals."""
+    """Percentile intervals from prompt clusters, never independent A/B calls."""
     if not bootstrap_results:
         return {}
-
     if np is None:
-        raise ImportError("numpy is required for statistical analysis. Please install it with: pip install numpy")
+        raise ImportError("numpy is required for statistical analysis")
 
-    # Calculate confidence intervals using percentile method
-    def calculate_ci(data, confidence=0.95):
-        alpha = 1 - confidence
-        lower = np.percentile(data, (alpha/2) * 100)
-        upper = np.percentile(data, (1 - alpha/2) * 100)
-        return [float(lower), float(upper)]
-
-    # Extract overall winner win rates (exclude iterations with 0 valid comparisons)
-    model1_overall_win_rates = []
-    model2_overall_win_rates = []
-    overall_exclusion_rates = []
-
-    # Extract survey winner win rates (exclude iterations with 0 valid comparisons)
-    model1_survey_win_rates = []
-    model2_survey_win_rates = []
-    survey_tie_rates = []
-    survey_exclusion_rates = []
-
-    overall_iterations_excluded = 0
-    survey_iterations_excluded = 0
-
-    for iteration_result in bootstrap_results:
-        analysis = iteration_result["analysis"]
-        overall_analysis = analysis["overall_analysis"]
-        survey_analysis = analysis["survey_analysis"]
-
-        # Overall winner statistics - only include iterations with valid comparisons > 0
-        if overall_analysis["valid_comparisons"] > 0:
-            model1_overall_win_rates.append(overall_analysis["model1_win_rate"])
-            model2_overall_win_rates.append(overall_analysis["model2_win_rate"])
-            total = analysis["total_comparisons"]
-            overall_exclusion_rates.append(overall_analysis["excluded"] / total if total > 0 else 0)
-        else:
-            overall_iterations_excluded += 1
-            overall_exclusion_rates.append(1.0)
-
-        # Survey winner statistics - only include iterations with valid comparisons > 0
-        if survey_analysis["valid_comparisons"] > 0:
-            model1_survey_win_rates.append(survey_analysis["model1_win_rate"])
-            model2_survey_win_rates.append(survey_analysis["model2_win_rate"])
-            survey_tie_rates.append(survey_analysis["tie_rate"])
-            total = analysis["total_comparisons"]
-            survey_exclusion_rates.append(survey_analysis["excluded"] / total if total > 0 else 0)
-        else:
-            survey_iterations_excluded += 1
-            survey_exclusion_rates.append(1.0)
-
-    # Convert to numpy arrays (may be empty if all iterations excluded)
-    model1_overall_win_rates = np.array(model1_overall_win_rates) if model1_overall_win_rates else np.array([])
-    model2_overall_win_rates = np.array(model2_overall_win_rates) if model2_overall_win_rates else np.array([])
-    overall_exclusion_rates = np.array(overall_exclusion_rates) if overall_exclusion_rates else np.array([])
-
-    model1_survey_win_rates = np.array(model1_survey_win_rates) if model1_survey_win_rates else np.array([])
-    model2_survey_win_rates = np.array(model2_survey_win_rates) if model2_survey_win_rates else np.array([])
-    survey_tie_rates = np.array(survey_tie_rates) if survey_tie_rates else np.array([])
-    survey_exclusion_rates = np.array(survey_exclusion_rates) if survey_exclusion_rates else np.array([])
-
-    # Helper function to calculate stats safely (handles empty arrays)
-    def safe_stats(data, include_ci_99=True):
-        if len(data) == 0:
-            result = {
-                "mean": None,
-                "std": None,
-                "min": None,
-                "max": None,
-                "ci_95": [None, None],
-                "raw_values": []
-            }
-            if include_ci_99:
-                result["ci_99"] = [None, None]
-            return result
-        result = {
-            "mean": float(np.mean(data)),
-            "std": float(np.std(data)),
-            "min": float(np.min(data)),
-            "max": float(np.max(data)),
-            "ci_95": calculate_ci(data, 0.95),
-            "raw_values": data.tolist()
+    def safe_stats(values, include_ci_99=True):
+        values = np.array(values, dtype=float)
+        output = {
+            "mean": float(np.mean(values)) if len(values) else None,
+            "std": float(np.std(values)) if len(values) else None,
+            "min": float(np.min(values)) if len(values) else None,
+            "max": float(np.max(values)) if len(values) else None,
+            "raw_values": values.tolist(),
+            "ci_95": np.percentile(values, [2.5, 97.5]).tolist() if len(values) else [None, None],
         }
         if include_ci_99:
-            result["ci_99"] = calculate_ci(data, 0.99)
-        return result
+            output["ci_99"] = np.percentile(values, [0.5, 99.5]).tolist() if len(values) else [None, None]
+        return output
 
-    return {
-        "bootstrap_iterations": len(bootstrap_results),
-        "overall_winner_analysis": {
-            "iterations_with_valid_comparisons": len(model1_overall_win_rates),
-            "iterations_excluded": overall_iterations_excluded,
-            "model1_win_rate_distribution": safe_stats(model1_overall_win_rates, include_ci_99=True),
-            "model2_win_rate_distribution": safe_stats(model2_overall_win_rates, include_ci_99=True),
-            "exclusion_rate_distribution": safe_stats(overall_exclusion_rates, include_ci_99=False)
-        },
-        "survey_winner_analysis": {
-            "iterations_with_valid_comparisons": len(model1_survey_win_rates),
-            "iterations_excluded": survey_iterations_excluded,
-            "model1_win_rate_distribution": safe_stats(model1_survey_win_rates, include_ci_99=True),
-            "model2_win_rate_distribution": safe_stats(model2_survey_win_rates, include_ci_99=True),
-            "tie_rate_distribution": safe_stats(survey_tie_rates, include_ci_99=True),
-            "exclusion_rate_distribution": safe_stats(survey_exclusion_rates, include_ci_99=False)
+    output = {"bootstrap_iterations": len(bootstrap_results)}
+    for endpoint in ("overall", "survey"):
+        analyses = [result["analysis"][f"{endpoint}_analysis"] for result in bootstrap_results]
+        valid = [analysis for analysis in analyses if analysis["valid_comparisons"] > 0]
+        summary = {
+            "iterations_with_valid_comparisons": len(valid),
+            "iterations_excluded": len(analyses) - len(valid),
+            "exclusion_rate_distribution": safe_stats([
+                analysis["excluded"] / result["analysis"]["total_comparisons"]
+                for analysis, result in zip(analyses, bootstrap_results)
+            ], include_ci_99=False),
         }
-    }
+        for model in ("model1", "model2"):
+            summary[f"{model}_win_rate_distribution"] = safe_stats([analysis[f"{model}_win_rate"] for analysis in valid])
+            summary[f"{model}_score_distribution"] = safe_stats([analysis[f"{model}_mean_score"] for analysis in valid])
+        for metric in ("tie_rate", "order_disagreement_rate"):
+            summary[f"{metric}_distribution"] = safe_stats([analysis[metric] for analysis in valid])
+        output[f"{endpoint}_winner_analysis"] = summary
+    return output
 
 
 def _cache_key(item: Dict[str, str], api_type: str, judge_model: str, allow_ties: bool,
@@ -866,40 +802,32 @@ def _append_judgment_cache(cache_path: str, cache_key: str, result: Dict[str, An
 
 
 def _analyze_iteration(iteration_results: List[Dict[str, Any]]) -> Dict[str, Any]:
-    valid_overall = [result for result in iteration_results if not result.get("overall_parsing_failed", False)
-                     and result.get("overall_winner") in ("model1", "model2", "tie")]
-    model1_overall_wins = sum(result.get("overall_winner") == "model1" for result in valid_overall)
-    model2_overall_wins = sum(result.get("overall_winner") == "model2" for result in valid_overall)
-    overall_ties = sum(result.get("overall_winner") == "tie" for result in valid_overall)
-
-    valid_survey = [result for result in iteration_results if result.get("survey_winner") is not None]
-    model1_survey_wins = sum(result.get("survey_winner") == "model1" for result in valid_survey)
-    model2_survey_wins = sum(result.get("survey_winner") == "model2" for result in valid_survey)
-    survey_ties = sum(result.get("survey_winner") == "tie" for result in valid_survey)
-
-    return {
-        "total_comparisons": len(iteration_results),
-        "overall_analysis": {
-            "valid_comparisons": len(valid_overall),
-            "excluded": len(iteration_results) - len(valid_overall),
-            "model1_wins": model1_overall_wins,
-            "model2_wins": model2_overall_wins,
-            "ties": overall_ties,
-            "tie_rate": overall_ties / len(valid_overall) if valid_overall else None,
-            "model1_win_rate": model1_overall_wins / len(valid_overall) if valid_overall else 0,
-            "model2_win_rate": model2_overall_wins / len(valid_overall) if valid_overall else 0,
-        },
-        "survey_analysis": {
-            "valid_comparisons": len(valid_survey),
-            "excluded": len(iteration_results) - len(valid_survey),
-            "model1_wins": model1_survey_wins,
-            "model2_wins": model2_survey_wins,
-            "ties": survey_ties,
-            "model1_win_rate": model1_survey_wins / len(valid_survey) if valid_survey else 0,
-            "model2_win_rate": model2_survey_wins / len(valid_survey) if valid_survey else 0,
-            "tie_rate": survey_ties / len(valid_survey) if valid_survey else 0,
-        },
-    }
+    output = {"total_comparisons": len(iteration_results)}
+    single_scores = {"model1": 1.0, "model2": 0.0, "tie": 0.5}
+    for endpoint in ("overall", "survey"):
+        valid = [result for result in iteration_results
+                 if result.get(f"{endpoint}_winner") in (*single_scores, "order_disagreement")
+                 and not result.get(f"{endpoint}_parsing_failed", False)]
+        counts = {outcome: sum(result[f"{endpoint}_winner"] == outcome for result in valid)
+                  for outcome in (*single_scores, "order_disagreement")}
+        model1_scores = [result.get(f"{endpoint}_model1_score", single_scores.get(result[f"{endpoint}_winner"]))
+                         for result in valid]
+        model1_mean = sum(model1_scores) / len(valid) if valid else None
+        output[f"{endpoint}_analysis"] = {
+            "valid_comparisons": len(valid),
+            "excluded": len(iteration_results) - len(valid),
+            "model1_wins": counts["model1"],
+            "model2_wins": counts["model2"],
+            "ties": counts["tie"],
+            "order_disagreements": counts["order_disagreement"],
+            "model1_win_rate": counts["model1"] / len(valid) if valid else None,
+            "model2_win_rate": counts["model2"] / len(valid) if valid else None,
+            "tie_rate": counts["tie"] / len(valid) if valid else None,
+            "order_disagreement_rate": counts["order_disagreement"] / len(valid) if valid else None,
+            "model1_mean_score": model1_mean,
+            "model2_mean_score": 1 - model1_mean if valid else None,
+        }
+    return output
 
 
 def run_bootstrap_evaluation(meta1: Dict[str, Any], items1: List[Dict[str, str]],
@@ -907,8 +835,8 @@ def run_bootstrap_evaluation(meta1: Dict[str, Any], items1: List[Dict[str, str]]
                              N: int, B: int, judge_model: str, api_type: str, judge_client,
                              allow_ties: bool, seed: int, cache_path: str,
                              thinking_mode: str = "disabled", refresh_cache: bool = False,
-                             max_retries: int = 5, base_url: str = "") -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[int]]:
-    """Judge N unique pairs once, then perform all B bootstrap resamples locally."""
+                             max_retries: int = 5, base_url: str = "", judge_both_orders: bool = False) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[int]]:
+    """Judge each prompt once or in both orders, then bootstrap prompt clusters."""
     if np is None:
         raise ImportError("numpy is required for bootstrap sampling. Please install it with: pip install numpy")
 
@@ -921,55 +849,62 @@ def run_bootstrap_evaluation(meta1: Dict[str, Any], items1: List[Dict[str, str]]
 
     selection_rng = random.Random(seed)
     selected_indices = selection_rng.sample(range(total_prompts), N)
+    if judge_both_orders and len({all_items[index]["prompt"] for index in selected_indices}) != N:
+        raise ValueError("Both-order evaluation requires unique prompts; deduplicate the held-out sample")
     cached_results = {} if refresh_cache else _load_judgment_cache(cache_path)
     judged_results = []
 
-    print(f"Judging {N} unique prompt pairs once; {B} bootstrap resamples will run locally")
-    for source_index in tqdm(selected_indices, desc="LLM judge calls"):
+    calls_per_prompt = 2 if judge_both_orders else 1
+    print(f"Judging {N} prompt pairs in {calls_per_prompt} order(s); {B} prompt-cluster bootstrap resamples run locally")
+    for source_index in tqdm(selected_indices, desc="LLM judge prompt pairs"):
         item = all_items[source_index]
-        order_swapped = selection_rng.choice([True, False])
-        cache_key = _cache_key(item, api_type, judge_model, allow_ties, order_swapped, thinking_mode, base_url)
-        cached_result = cached_results.get(cache_key)
-        if cached_result is None:
-            judgment = call_judge(
-                api_type,
-                judge_client,
-                judge_model,
-                item["prompt"],
-                item["completion1"],
-                item["completion2"],
-                allow_ties,
-                order_swapped=order_swapped,
-                thinking_mode=thinking_mode,
-                max_retries=max_retries,
-            )
-            result = {
-                "prompt": item["prompt"],
-                "model1_completion": item["completion1"],
-                "model2_completion": item["completion2"],
-                "judgment": judgment,
-                "overall_winner": judgment.get("overall_winner"),
-                "overall_parsing_failed": judgment.get("overall_parsing_failed", False),
-                "survey_winner": judgment.get("survey_winner"),
-                "survey_calculation": judgment.get("survey_calculation", {}),
-                "criterion_evaluations": judgment.get("criterion_evaluations", {}),
-                "model1_name": "model1",
-                "model2_name": "model2",
-                "order_swapped": order_swapped,
-                "source_index": source_index,
-                "cache_key": cache_key,
-            }
-            # Cache only valid decisions; API and parse failures are retried on
-            # the next run, while their raw evidence remains in the result JSON.
-            if "parse_error" not in judgment and not judgment.get("overall_parsing_failed", True) and judgment.get("survey_winner") is not None:
-                _append_judgment_cache(cache_path, cache_key, result)
-                cached_results[cache_key] = result
-            result["cache_hit"] = False
-        else:
-            result = dict(cached_result)
-            result["cache_hit"] = True
-            result["source_index"] = source_index
-        judged_results.append(result)
+        first_order = selection_rng.choice([True, False])
+        orders = [first_order, not first_order] if judge_both_orders else [first_order]
+        order_results = []
+        for order_swapped in orders:
+            cache_key = _cache_key(item, api_type, judge_model, allow_ties, order_swapped, thinking_mode, base_url)
+            cached_result = cached_results.get(cache_key)
+            if cached_result is None:
+                judgment = call_judge(
+                    api_type,
+                    judge_client,
+                    judge_model,
+                    item["prompt"],
+                    item["completion1"],
+                    item["completion2"],
+                    allow_ties,
+                    order_swapped=order_swapped,
+                    thinking_mode=thinking_mode,
+                    max_retries=max_retries,
+                )
+                result = {
+                    "prompt": item["prompt"],
+                    "model1_completion": item["completion1"],
+                    "model2_completion": item["completion2"],
+                    "judgment": judgment,
+                    "overall_winner": judgment.get("overall_winner"),
+                    "overall_parsing_failed": judgment.get("overall_parsing_failed", False),
+                    "survey_winner": judgment.get("survey_winner"),
+                    "survey_calculation": judgment.get("survey_calculation", {}),
+                    "criterion_evaluations": judgment.get("criterion_evaluations", {}),
+                    "model1_name": "model1",
+                    "model2_name": "model2",
+                    "order_swapped": order_swapped,
+                    "source_index": source_index,
+                    "cache_key": cache_key,
+                }
+                # Cache only valid decisions; API and parse failures are retried on
+                # the next run, while their raw evidence remains in the result JSON.
+                if "parse_error" not in judgment and not judgment.get("overall_parsing_failed", True) and judgment.get("survey_winner") is not None:
+                    _append_judgment_cache(cache_path, cache_key, result)
+                    cached_results[cache_key] = result
+                result["cache_hit"] = False
+            else:
+                result = dict(cached_result)
+                result["cache_hit"] = True
+                result["source_index"] = source_index
+            order_results.append(result)
+        judged_results.append(combine_order_judgments(order_results) if judge_both_orders else order_results[0])
 
     bootstrap_rng = np.random.default_rng(seed)
     bootstrap_results = []
@@ -990,12 +925,14 @@ def save_bootstrap_results(output_path: str, model1_path: str, model2_path: str,
                           bootstrap_results: List[Dict[str, Any]], bootstrap_analysis: Dict[str, Any],
                           judged_results: List[Dict[str, Any]], selected_indices: List[int],
                           cache_path: str, base_url: Optional[str], thinking_mode: str,
-                          completion_index: int = 0, validation: Optional[Dict[str, Any]] = None) -> None:
+                          completion_index: int = 0, validation: Optional[Dict[str, Any]] = None,
+                          judge_both_orders: bool = False, source_metadata=None) -> None:
     """Save comprehensive bootstrap results to JSON file."""
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
 
     usage_totals = {"input_tokens": 0, "output_tokens": 0, "cached_input_tokens": 0}
-    for result in judged_results:
+    raw_judgments = [order for result in judged_results for order in result.get("order_judgments", [result])]
+    for result in raw_judgments:
         if result.get("cache_hit"):
             continue
         usage = result.get("judgment", {}).get("api_usage", {})
@@ -1020,13 +957,25 @@ def save_bootstrap_results(output_path: str, model1_path: str, model2_path: str,
             "protocol_version": JUDGE_PROTOCOL_VERSION,
             "parser_version": JUDGE_PARSER_VERSION,
             "cache_path": os.path.abspath(cache_path),
-            "methodology": "judge_N_unique_pairs_once_then_bootstrap_locally_with_replacement"
+            "judge_both_orders": judge_both_orders,
+            "aggregation_version": "paired-order-score-v1" if judge_both_orders else "single-order-v1",
+            "methodology": "judge_each_prompt_in_both_orders_then_bootstrap_prompt_clusters" if judge_both_orders else "judge_N_unique_pairs_once_then_bootstrap_locally_with_replacement",
+            "score_definition": "mean_across_orders_of_win_1_tie_0.5_loss_0",
+            "score_denominator": "valid prompt clusters only; missing judgments are excluded, never scored as ties",
+            "confidence_interval_scope": "held-out prompt sampling, conditional on these checkpoints, generated responses and judge outcomes; not training-seed variability"
         },
+        "source_metadata": source_metadata,
         "selected_source_indices": selected_indices,
         "api_usage": usage_totals,
         "cache_summary": {
-            "hits_this_run": sum(bool(result.get("cache_hit")) for result in judged_results),
-            "api_calls_this_run": sum(not bool(result.get("cache_hit")) for result in judged_results),
+            "hits_this_run": sum(bool(result.get("cache_hit")) for result in raw_judgments),
+            "api_calls_this_run": sum(not bool(result.get("cache_hit")) for result in raw_judgments),
+            "logical_judgments": len(raw_judgments),
+            "failed_api_judgments": sum("parse_error" in result.get("judgment", {}) for result in raw_judgments),
+            "failed_parse_judgments": sum(
+                "parse_error" not in result.get("judgment", {}) and
+                (result.get("overall_parsing_failed", True) or result.get("survey_winner") is None)
+                for result in raw_judgments),
         },
         "judged_results": judged_results,
         "bootstrap_analysis": bootstrap_analysis,
@@ -1139,6 +1088,19 @@ def print_bootstrap_summary(model1_path: str, model2_path: str, judge_model: str
     print("=" * 100)
 
 
+def print_paired_order_summary(observed, bootstrap_analysis):
+    print("\nTwo-order blinded comparison (prompt is the bootstrap unit)")
+    for endpoint in ("overall", "survey"):
+        counts = observed[f"{endpoint}_analysis"]
+        ci = bootstrap_analysis[f"{endpoint}_winner_analysis"]["model2_score_distribution"]["ci_95"]
+        print(f"{endpoint}: valid={counts['valid_comparisons']}, failed={counts['excluded']}, "
+              f"model1 consistent wins={counts['model1_wins']}, model2 consistent wins={counts['model2_wins']}, "
+              f"explicit ties={counts['ties']}, order disagreements={counts['order_disagreements']}")
+        print(f"  Model2 score={counts['model2_mean_score']:.4f}, prompt-bootstrap 95% CI={ci}; neutral=0.5")
+    print("The interval describes prompt sampling conditional on these checkpoints/responses/judge outcomes, "
+          "not uncertainty across training seeds. A CI crossing 0.5 is inconclusive.")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Bootstrap-based LLM-as-judge evaluation with confidence intervals")
     parser.add_argument("--completions1", required=True, help="Path to first model's completions artifact JSON/JSONL")
@@ -1159,6 +1121,8 @@ def main():
                         help="Required valid overall AND full-survey fraction (default: all judgments)")
     parser.add_argument("--N", type=int, default=100, help="Number of unique prompt pairs sent to the judge")
     parser.add_argument("--B", type=int, default=1000, help="Number of local bootstrap resamples")
+    parser.add_argument("--judge-both-orders", action="store_true",
+                        help="Blindly judge A/B and B/A for every prompt (2N calls before cache/retries); bootstrap N prompt clusters")
     tie_group = parser.add_mutually_exclusive_group()
     tie_group.add_argument("--allow-ties", action="store_true", help="Allow ties in evaluation")
     tie_group.add_argument("--no-ties", action="store_true", help="Disable ties in evaluation")
@@ -1218,6 +1182,7 @@ def main():
         refresh_cache=args.refresh_cache,
         max_retries=args.max_retries,
         base_url=resolved_base_url,
+        judge_both_orders=args.judge_both_orders,
     )
 
     # Analyze bootstrap results
@@ -1244,6 +1209,8 @@ def main():
         allow_ties,
         completion_index=args.completion_index
     )
+    if args.judge_both_orders:
+        filename = filename.replace("_bootstrap.json", "_both_orders_bootstrap.json")
     output_path = os.path.join(output_dir, filename)
 
     save_bootstrap_results(
@@ -1265,12 +1232,17 @@ def main():
         args.thinking_mode,
         completion_index=args.completion_index,
         validation=validation,
+        judge_both_orders=args.judge_both_orders,
+        source_metadata={"model1": meta1, "model2": meta2},
     )
 
     # Print summary
     if not validation["passed"]:
         print(f"INVALID evaluation: {validation}. Evidence saved; fix failures and retry. No winner declared.")
         return 1
+    if args.judge_both_orders:
+        print_paired_order_summary(observed, bootstrap_analysis)
+        return 0
     print_bootstrap_summary(
         meta1.get("model_path", "model1"),
         meta2.get("model_path", "model2"),

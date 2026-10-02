@@ -18,6 +18,7 @@ import time
 import warnings
 from collections import defaultdict, deque
 from collections.abc import Sized
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from typing import Any, Callable, Optional, Union
 
@@ -56,6 +57,7 @@ from trl.trainer.callbacks import SyncRefModelCallback
 from .configs import GRPOConfig
 from .advantages import compute_advantages, configure_advantage
 from .objectives import reduce_policy_loss
+from .training_schedule import TrainingSchedule, append_schedule_trace, permute_rollout_payload
 from trl.trainer.utils import (
     disable_dropout_in_model,
     generate_model_card,
@@ -243,12 +245,28 @@ def trim_padded_microbatch(
                 trimmed[key] = inputs[key][:, -prompt_width:]
     if completion_lengths is not None:
         completion_width = max(1, int(completion_lengths.max().item()))
-        for key in ("completion_ids", "completion_mask", "old_per_token_logps"):
+        for key in ("completion_ids", "completion_mask", "old_per_token_logps", "ref_per_token_logps"):
             if inputs.get(key) is not None:
                 trimmed[key] = inputs[key][:, :completion_width]
     trimmed.pop("_prompt_lengths", None)
     trimmed.pop("_completion_lengths", None)
     return trimmed
+
+
+def completion_lists_from_tensors(
+    completion_ids: torch.Tensor, completion_lengths: torch.Tensor
+) -> tuple[list[list[int]], list[list[int]], torch.Tensor]:
+    """Transfer token IDs/lengths in bulk, retaining the first EOS in each prefix.
+
+    Lengths come from the original contiguous EOS mask, before optionally
+    masking truncated responses out of the loss. Return the padded rows too:
+    decoding must preserve its existing full-row semantics, and can reuse this
+    CPU copy instead of transferring the same CUDA tensor a second time.
+    """
+    rows = completion_ids.detach().cpu().tolist()
+    lengths = completion_lengths.detach().cpu()
+    valid_rows = [row[:length] for row, length in zip(rows, lengths.tolist())]
+    return rows, valid_rows, lengths
 
 
 def summarize_timing_samples(samples: dict[str, list[float]]) -> dict[str, float]:
@@ -314,6 +332,29 @@ def nanmax(tensor: torch.Tensor) -> torch.Tensor:
     if torch.isnan(tensor).all():
         return torch.tensor(float("nan"), dtype=tensor.dtype, device=tensor.device)
     return torch.max(tensor[~torch.isnan(tensor)])
+
+
+def run_reward_reference_overlap(reward_call, reference_call):
+    """Run only the remote request in a worker; model scoring stays on this thread.
+
+    Executor exit joins the worker even when either callable raises. Timings are
+    independent wall intervals and overlap, so they must not be added together.
+    """
+    def timed_reward():
+        started = time.perf_counter()
+        rewards = reward_call()
+        return rewards, time.perf_counter() - started
+
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="qrm-reference") as executor:
+        reward_future = executor.submit(timed_reward)
+        reference_started = time.perf_counter()
+        reference_logps = reference_call()
+        reference_elapsed = time.perf_counter() - reference_started
+        rewards, reward_elapsed = reward_future.result()
+    return rewards, reference_logps, {
+        "qrm_service": reward_elapsed,
+        "reference_precompute": reference_elapsed,
+    }
 
 
 class GRPOTrainer(Trainer):
@@ -626,6 +667,11 @@ class GRPOTrainer(Trainer):
                     warnings.warn(f"Could not create the Gloo control group; falling back to NCCL objects: {error}")
             else:
                 warnings.warn("Gloo object collectives requested but unavailable; falling back to the default backend")
+
+        self.training_schedule = None
+        schedule_path = getattr(args, "training_schedule_path", None)
+        if schedule_path is not None:
+            self.training_schedule = TrainingSchedule.load(schedule_path, args, self.accelerator.num_processes)
 
         # Reference model
         self.beta = args.beta
@@ -1041,10 +1087,115 @@ class GRPOTrainer(Trainer):
             logits = logits[:, -logits_to_keep:]
             # Divide logits by sampling temperature.
             # See https://huggingface.co/blog/the_n_implementation_details_of_rlhf_with_ppo#policy-training-implementation-details
-            logits = logits / self.temperature
+            if self.temperature != 1.0:
+                logits = logits / self.temperature
             logps = selective_log_softmax(logits, input_ids_batch)  # compute logprobs for the input tokens
             all_logps.append(logps)
-        return torch.cat(all_logps, dim=0)
+        return all_logps[0] if len(all_logps) == 1 else torch.cat(all_logps, dim=0)
+
+    def _can_overlap_qrm_reference(self, mode: str) -> bool:
+        """Conservative guards keep caching inside one unchanged policy step."""
+        if not getattr(self.args, "overlap_qrm_reference", False) or mode != "train":
+            return False
+        reasons = []
+        if self.beta <= 0:
+            reasons.append("beta must be positive")
+        if self.reward_func_names != ["qrm_server"]:
+            reasons.append("exactly one qrm_server reward is required")
+        if not self.args.disable_dropout or self.args.sync_ref_model:
+            reasons.append("dropout must be disabled and reference synchronization off")
+        # Some attention implementations use F.dropout/FlashAttention's float
+        # argument rather than nn.Dropout, which disable_dropout_in_model does
+        # not necessarily change. Inspect the actual reference configuration.
+        reference_model = self.ref_model if self.ref_model is not None else self.model
+        reference_model = self.accelerator.unwrap_model(reference_model)
+        if is_peft_model(reference_model):
+            reference_model = reference_model.get_base_model()
+        reference_config = getattr(reference_model, "config", None)
+        # Forward ordering has only been validated for these dense models.
+        # Other architectures can consume RNG or update state even without
+        # nn.Dropout (for example, MoE router jitter).
+        if getattr(reference_config, "model_type", None) not in {"qwen2", "qwen3"}:
+            reasons.append("reference overlap supports only dense Qwen2/Qwen3 models")
+        reference_configs = [reference_config]
+        if reference_config is not None and hasattr(reference_config, "get_text_config"):
+            reference_configs.append(reference_config.get_text_config())
+        for config in reference_configs:
+            rope_scaling = getattr(config, "rope_scaling", None)
+            if rope_scaling and (
+                not isinstance(rope_scaling, dict)
+                or rope_scaling.get("rope_type", rope_scaling.get("type", "default")) != "default"
+            ):
+                reasons.append("reference overlap requires default RoPE scaling")
+                break
+        functional_dropout_fields = (
+            "attention_dropout", "attn_pdrop", "attention_probs_dropout_prob",
+            "attention_dropout_prob", "attn_dropout", "attention_dropout_rate",
+        )
+        for name in functional_dropout_fields:
+            if any(getattr(config, name, 0) not in (None, 0) for config in reference_configs):
+                reasons.append(f"reference config {name} must be zero")
+        if self.args.per_device_train_batch_size != 1 or not self.trim_unused_padding:
+            reasons.append("microbatch=1 and trim_unused_padding=true are required")
+        if self.use_liger_loss:
+            reasons.append("the overlap path currently requires the ordinary policy loss")
+        if self.is_fsdp_enabled:
+            reasons.append("FSDP is unsupported")
+        plugin = self.accelerator.state.deepspeed_plugin
+        if self.is_deepspeed_enabled and (plugin is None or plugin.zero_stage != 2):
+            reasons.append("only DeepSpeed ZeRO-2 is supported")
+        if self.accelerator.num_processes < 2:
+            reasons.append("distributed QRM scoring is required")
+        if (
+            self.num_iterations != 1
+            or self.args.gradient_accumulation_steps % self.args.steps_per_generation != 0
+        ):
+            reasons.append("one iteration and generation batches aligned within optimizer steps are required")
+        if reasons:
+            if not getattr(self, "_reference_overlap_fallback_warned", False):
+                if self.accelerator.is_main_process:
+                    warnings.warn("QRM/reference overlap disabled: " + "; ".join(reasons))
+                self._reference_overlap_fallback_warned = True
+            return False
+        return True
+
+    def _precompute_reference_logps(
+        self, prompt_ids, prompt_mask, completion_ids, completion_mask, prompt_lengths, completion_lengths
+    ):
+        """Score the same individually trimmed inputs used by policy microbatch 1.
+
+        No policy update, RNG sampling, train/eval mode change, or optimizer call
+        occurs here. The detached cache follows ordinary shuffle/split/trim.
+        """
+        prompt_widths = prompt_lengths.detach().cpu().tolist()
+        completion_widths = completion_lengths.detach().cpu().tolist()
+        reference_model = self.ref_model if self.ref_model is not None else self.model
+        adapter_context = (
+            nullcontext() if self.ref_model is not None
+            else self.accelerator.unwrap_model(self.model).disable_adapter()
+        )
+        cached_logps = None
+        with torch.no_grad(), self.compute_loss_context_manager(), adapter_context:
+            for index, (prompt_width, completion_width) in enumerate(zip(prompt_widths, completion_widths)):
+                prompt_width, completion_width = max(1, int(prompt_width)), max(1, int(completion_width))
+                input_ids = torch.cat((
+                    prompt_ids[index : index + 1, -prompt_width:],
+                    completion_ids[index : index + 1, :completion_width],
+                ), dim=1)
+                attention_mask = torch.cat((
+                    prompt_mask[index : index + 1, -prompt_width:],
+                    completion_mask[index : index + 1, :completion_width],
+                ), dim=1)
+                logps = self._get_per_token_logps(reference_model, input_ids, attention_mask, completion_width)
+                if cached_logps is None:
+                    cached_logps = logps.new_zeros(completion_ids.shape)
+                cached_logps[index : index + 1, :completion_width] = logps.detach()
+        # The remote request continues in its worker while this rank finishes
+        # queued scoring kernels. Count completed reference work, not just CUDA
+        # launch time, and surface asynchronous failures before error exchange.
+        if cached_logps is not None and cached_logps.is_cuda:
+            torch.cuda.synchronize(cached_logps.device)
+        return cached_logps
 
     def _sync_fsdp_params_to_vllm(self, module: nn.Module, prefix: str = "", visited=None):
         """Memory-efficient post-order traversal of FSDP modules to extract full parameters and sync with vLLM."""
@@ -1175,6 +1326,33 @@ class GRPOTrainer(Trainer):
             for rank, value in enumerate(values.tolist()):
                 self._metrics[mode][f"timing/{name}_rank{rank}_s"].append(value)
 
+    def _prepare_training_schedule_trace(self, generation_batch):
+        """All ranks agree on validity before any generation collectives run."""
+        trace, local_error = None, None
+        try:
+            trace = self.training_schedule.prepare_trace(
+                generation_batch, self.state.global_step, self._step, self.accelerator.process_index
+            )
+        except Exception as error:
+            local_error = f"rank {self.accelerator.process_index}: {type(error).__name__}: {error}"
+        errors = self._gather_python_objects([local_error])
+        if any(error is not None for error in errors):
+            raise ValueError("Training schedule validation failed: " + "; ".join(error for error in errors if error))
+        return trace
+
+    def _apply_training_schedule_trace(self, generation_batch, trace):
+        """Record the permutation that is actually consumed by this rollout."""
+        local_error = None
+        try:
+            generation_batch = permute_rollout_payload(generation_batch, trace["permutation"])
+            append_schedule_trace(self.args.output_dir, trace)
+        except Exception as error:
+            local_error = f"rank {self.accelerator.process_index}: {type(error).__name__}: {error}"
+        errors = self._gather_python_objects([local_error])
+        if any(error is not None for error in errors):
+            raise ValueError("Training schedule trace failed: " + "; ".join(error for error in errors if error))
+        return generation_batch
+
     @profiling_decorator
     def _prepare_inputs(
         self, generation_batch: dict[str, Union[torch.Tensor, Any]]
@@ -1198,8 +1376,14 @@ class GRPOTrainer(Trainer):
             generate_every = self.args.steps_per_generation * self.num_iterations
             if self._step % generate_every == 0 or self._buffered_inputs is None:
                 # self._buffered_inputs=None can occur when resuming from a checkpoint
+                schedule_trace = None
+                if getattr(self, "training_schedule", None) is not None:
+                    schedule_trace = self._prepare_training_schedule_trace(generation_batch)
                 generation_batch = self._generate_and_score_completions(generation_batch)
-                generation_batch = shuffle_tensor_dict(generation_batch)
+                if schedule_trace is None:
+                    generation_batch = shuffle_tensor_dict(generation_batch)
+                else:
+                    generation_batch = self._apply_training_schedule_trace(generation_batch, schedule_trace)
                 self._buffered_inputs = split_tensor_dict(generation_batch, self.args.steps_per_generation)
             buffer_index = self._step % self.args.steps_per_generation
             inputs = self._buffered_inputs[buffer_index]
@@ -1247,6 +1431,7 @@ class GRPOTrainer(Trainer):
             "qrm_service": 0.0,
             "qrm_broadcast": 0.0,
             "qrm_total": 0.0,
+            "reference_precompute": 0.0,
             "external_sync_wait": 0.0,
             "generation_score_total": 0.0,
         }
@@ -1383,17 +1568,13 @@ class GRPOTrainer(Trainer):
         sequence_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
         completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
 
-        # Convert tensor to a list of lists of token IDs. This will be passed to the reward function, avoiding the need
-        # to re-tokenize completions if the reward is computed from tokens.
-        completion_ids_list = [
-            [id.item() for id, m in zip(row, mask_row) if m] for row, mask_row in zip(completion_ids, completion_mask)
-        ]
-        completion_lengths_for_trimming = torch.tensor(
-            [len(ids) for ids in completion_ids_list], dtype=torch.long
-        )
-
         # Sum along sequence dimension (dim=1) to get completion length per sequence, used for logging
         completion_lengths = completion_mask.sum(1)
+        # Avoid a CUDA scalar synchronization for every mask/token. Reuse the
+        # bulk CPU copy for decoding as well as token-based reward functions.
+        completion_rows_cpu, completion_ids_list, completion_lengths_for_trimming = completion_lists_from_tensors(
+            completion_ids, completion_lengths
+        )
 
         # If mask_truncated_completions is enabled, zero out truncated completions in completion_mask
         if self.mask_truncated_completions:
@@ -1418,7 +1599,7 @@ class GRPOTrainer(Trainer):
                 old_per_token_logps = None
 
         # Decode the generated completions
-        completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
+        completions_text = self.processing_class.batch_decode(completion_rows_cpu, skip_special_tokens=True)
         if is_conversational(inputs[0]):
             completions = []
             for prompt, completion in zip(prompts, completions_text):
@@ -1427,6 +1608,8 @@ class GRPOTrainer(Trainer):
         else:
             completions = completions_text
 
+        cached_ref_per_token_logps = None
+        overlap_reference = self._can_overlap_qrm_reference(mode)
         rewards_per_func = torch.zeros(len(prompts), len(self.reward_funcs), device=device)
 
         # Repeat all input columns (but "prompt", "completion", and "completion_ids") to match the num of generations
@@ -1487,12 +1670,54 @@ class GRPOTrainer(Trainer):
                         phase_timings["qrm_gather"] += time.perf_counter() - gather_started
                         counts = [len(payload["prompts"]) for payload in rank_payloads]
                         if self.accelerator.is_main_process:
-                            service_started = time.perf_counter()
                             all_prompts = [item for payload in rank_payloads for item in payload["prompts"]]
                             all_completions = [item for payload in rank_payloads for item in payload["completions"]]
                             all_completion_ids = [
                                 item for payload in rank_payloads for item in payload["completion_ids"]
                             ]
+
+                        if overlap_reference:
+                            def reference_call():
+                                return self._precompute_reference_logps(
+                                    prompt_ids, prompt_mask, completion_ids, completion_mask,
+                                    prompt_lengths_for_trimming, completion_lengths_for_trimming,
+                                )
+
+                            overlap_exception = None
+                            try:
+                                if self.accelerator.is_main_process:
+                                    def reward_call():
+                                        return reward_func(
+                                            prompts=all_prompts, completions=all_completions,
+                                            completion_ids=all_completion_ids,
+                                        )
+
+                                    output_reward_func, cached_ref_per_token_logps, overlap_timings = (
+                                        run_reward_reference_overlap(reward_call, reference_call)
+                                    )
+                                    for name, elapsed in overlap_timings.items():
+                                        phase_timings[name] += elapsed
+                                else:
+                                    reference_started = time.perf_counter()
+                                    cached_ref_per_token_logps = reference_call()
+                                    phase_timings["reference_precompute"] += time.perf_counter() - reference_started
+                                    output_reward_func = [None] * sum(counts)
+                            except Exception as error:
+                                overlap_exception = error
+                                output_reward_func = [None] * sum(counts)
+                            # Every rank reaches this control collective even if
+                            # its own scoring failed; no peer waits for a reward
+                            # broadcast that the main rank abandoned on error.
+                            errors = self._gather_python_objects([
+                                None if overlap_exception is None else
+                                f"rank {self.accelerator.process_index}: {type(overlap_exception).__name__}: {overlap_exception}"
+                            ])
+                            if any(error is not None for error in errors):
+                                raise RuntimeError(
+                                    "QRM/reference overlap failed: " + "; ".join(error for error in errors if error is not None)
+                                ) from overlap_exception
+                        elif self.accelerator.is_main_process:
+                            service_started = time.perf_counter()
                             output_reward_func = reward_func(
                                 prompts=all_prompts,
                                 completions=all_completions,
@@ -1618,6 +1843,7 @@ class GRPOTrainer(Trainer):
             "completion_mask": completion_mask,
             "advantages": advantages,
             "old_per_token_logps": old_per_token_logps,
+            "ref_per_token_logps": cached_ref_per_token_logps,
         }
         if self.trim_unused_padding:
             result["_prompt_lengths"] = prompt_lengths_for_trimming
@@ -1633,8 +1859,8 @@ class GRPOTrainer(Trainer):
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
 
         # Compute the KL divergence between the model and the reference model
-        ref_per_token_logps = None
-        if self.beta != 0.0:
+        ref_per_token_logps = inputs.get("ref_per_token_logps")
+        if self.beta != 0.0 and ref_per_token_logps is None:
             with torch.no_grad():
                 if self.ref_model is not None:
                     ref_per_token_logps = self._get_per_token_logps(
@@ -1694,16 +1920,18 @@ class GRPOTrainer(Trainer):
 
         # Compute the KL divergence between the model and the reference model
         if self.beta != 0.0:
-            with torch.no_grad():
-                if self.ref_model is not None:
-                    ref_per_token_logps = self._get_per_token_logps(
-                        self.ref_model, input_ids, attention_mask, logits_to_keep
-                    )
-                else:
-                    with self.accelerator.unwrap_model(self.model).disable_adapter():
+            ref_per_token_logps = inputs.get("ref_per_token_logps")
+            if ref_per_token_logps is None:
+                with torch.no_grad():
+                    if self.ref_model is not None:
                         ref_per_token_logps = self._get_per_token_logps(
-                            self.model, input_ids, attention_mask, logits_to_keep
+                            self.ref_model, input_ids, attention_mask, logits_to_keep
                         )
+                    else:
+                        with self.accelerator.unwrap_model(self.model).disable_adapter():
+                            ref_per_token_logps = self._get_per_token_logps(
+                                self.model, input_ids, attention_mask, logits_to_keep
+                            )
             per_token_kl = (
                 torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
             )
@@ -1770,7 +1998,9 @@ class GRPOTrainer(Trainer):
         if self.beta != 0.0:
             mean_kl = (per_token_kl * completion_mask).sum() / valid_tokens
             local_metrics.append(mean_kl.detach())
-        gathered_metrics = self.accelerator.gather(torch.stack(local_metrics).unsqueeze(0))
+        # Move this tiny rank-by-metric matrix once; individual scalar/boolean
+        # reductions below must not each synchronize the policy GPU.
+        gathered_metrics = self.accelerator.gather(torch.stack(local_metrics).unsqueeze(0)).detach().cpu()
         gathered_low_clip, gathered_high_clip, gathered_clip_ratio = gathered_metrics[:, :3].unbind(dim=1)
         if self.beta != 0.0:
             self._metrics[mode]["kl"].append(gathered_metrics[:, 3].nanmean().item())

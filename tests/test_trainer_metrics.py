@@ -28,7 +28,7 @@ def load_policy_loss_method():
 @pytest.mark.parametrize("beta", [0.0, 0.04])
 @pytest.mark.parametrize("training", [False, True])
 @pytest.mark.parametrize("fully_masked", [False, True])
-def test_policy_metrics_use_one_collective_and_preserve_rank_reductions(beta, training, fully_masked):
+def test_policy_metrics_use_one_collective_and_preserve_rank_reductions(beta, training, fully_masked, monkeypatch):
     policy_loss = load_policy_loss_method()
     model = SimpleNamespace(training=training)
     reference = object()
@@ -38,6 +38,16 @@ def test_policy_metrics_use_one_collective_and_preserve_rank_reductions(beta, tr
     reference_logps = logps.detach() + 0.1
     mask = torch.zeros(2, 2, dtype=torch.long) if fully_masked else torch.tensor([[1, 0], [1, 1]])
     collected = []
+    host_transfers = []
+    original_cpu = torch.Tensor.cpu
+
+    def record_cpu(tensor, *args, **kwargs):
+        host_transfers.append((tuple(tensor.shape), tensor.requires_grad))
+        return original_cpu(tensor, *args, **kwargs)
+
+    # Verify a single bulk host transfer, not one transfer per statistic.
+    # The gather stub and reductions still operate on real Torch tensors.
+    monkeypatch.setattr(torch.Tensor, "cpu", record_cpu)
 
     def gather(local):
         collected.append(local)
@@ -67,6 +77,7 @@ def test_policy_metrics_use_one_collective_and_preserve_rank_reductions(beta, tr
     }
     result = policy_loss(trainer, model, inputs)
     assert len(collected) == 1
+    assert host_transfers == [((2, 4 if beta else 3), False)]
     metrics = trainer._metrics["train" if training else "eval"]
     local_clip = 0.0 if fully_masked else 1 / 3
     local_region = 0.0 if fully_masked else 2 / 3

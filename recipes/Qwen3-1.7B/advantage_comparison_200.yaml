@@ -1,0 +1,60 @@
+# Both arms start independently from this same pretrained checkpoint.
+steps: 200
+seed: 42
+model_name: Qwen/Qwen3-1.7B
+model_revision: 70d244cc86ccca08cf5af4e1e306ecf908b1ad5e
+qrm_model: friendshipkim/QRM-Llama3.1-8B-v2
+qrm_revision: 23c6db70a35875248f45b3cfbe6d237ba8ac3e6d
+training_recipe: recipes/Qwen3-1.7B/config_chat_regular_qrm_lora_4gpu_split.yaml
+accelerate_config: recipes/accelerate_configs/zero2_2gpus.yaml
+# Change these data fields before preparing a NEW experiment directory.
+data:
+  source: /data/baojun/datasets/ultrachat_200k_grpo_seed42
+  train_split: train
+  eval_source: null
+  eval_split: test
+  prompt_column: prompt
+  eval_prompt_column: null
+  adapter: auto
+system_prompt: ""
+world_size: 2
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 128
+num_generations: 8
+max_prompt_length: 2048
+max_completion_length: 3072
+# Only advantage and advantage_kwargs differ between the arms.
+delta: 0.01
+c: 0.08
+services:
+  vllm_gpus: "4"
+  qrm_gpu: "5"
+  train_gpus: "6,7"
+  vllm_http_port: 8000
+  qrm_http_port: 8001
+  training_port: 29501
+  weight_sync_port: 51216
+  max_model_len: 6144
+  qrm_max_length: 6144
+  qrm_max_batch_tokens: 6144
+  reward_batch_size: 4
+  vllm_max_num_seqs: 256
+  vllm_gpu_memory_utilization: 0.82
+evaluation:
+  num_prompts: 200
+  seed: 31415
+  gpu: "4"
+  # Greedy decoding removes additional response-sampling noise for this pilot.
+  temperature: 0.0
+  top_p: 1.0
+  max_new_tokens: 3072
+  vllm_gpu_memory: 0.85
+  bootstrap_iterations: 2000
+judge:
+  # Supply JUDGE_MODEL, JUDGE_BASE_URL, JUDGE_API_KEY at runtime.
+  # Use JUDGE_API_PROVIDER=deepseek for its thinking-mode API extension.
+  api_provider: openai
+  model: null
+  base_url: null
+  thinking_mode: disabled
+  max_retries: 3

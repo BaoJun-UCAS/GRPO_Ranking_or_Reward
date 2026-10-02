@@ -133,13 +133,95 @@ chat 会移除最后一个用户问题之后的参考 assistant 回答，保留�
 `raw` 直接使用字符串，适合无 chat template 的基础模型；QRM 客户端将原始 prompt/回答包装为 user/assistant 评分。
 `MAX_TRAIN_SAMPLES` / `MAX_EVAL_SAMPLES` 只用于调试，先限量再预处理。
 
+### 200 step 公平对照：原始 GRPO 与改进 advantage
+
+入口是 `scripts/compare_advantages.py`，配置在
+[`advantage_comparison_200.yaml`](recipes/Qwen3-1.7B/advantage_comparison_200.yaml)。
+`baseline` 使用原始 `grpo` advantage，`improved` 使用 `robust_pairwise(delta=0.01,c=0.08)`；
+两组分别从相同固定 revision 的预训练模型开始，不从 baseline 的训练结果继续训练。
+优化器、LoRA、BNPO loss、KL、batch 和长度设置完全相同。
+
+先激活 `grpo` 环境，在项目根目录执行：
+
+```bash
+export CUDA_HOME="$CONDA_PREFIX"
+python scripts/compare_advantages.py prepare --experiment-dir grpo_runs/advantage-200
+python scripts/compare_advantages.py train --experiment-dir grpo_runs/advantage-200 --dry-run
+python scripts/compare_advantages.py train --experiment-dir grpo_runs/advantage-200
+
+# 两个训练模型在同一批独立测试题上生成回答；此阶段不调用裁判 API。
+python scripts/compare_advantages.py generate --experiment-dir grpo_runs/advantage-200
+
+# 任意支持当前 judge 接口的独立 LLM；使用你自己的实际 endpoint/model。
+export JUDGE_API_KEY='你的 API key'
+export JUDGE_BASE_URL='你的 OpenAI 兼容 API 地址'
+export JUDGE_MODEL='你的裁判模型名'
+python scripts/compare_advantages.py judge --experiment-dir grpo_runs/advantage-200
+```
+
+默认生成使用 GPU 4；四卡训练使用 4/5/6,7。模型、数据路径、GPU、步数和评测规模均可在配置中修改，
+**修改后使用新的 experiment-dir**。也可以在配置好裁判环境变量后，用
+`python scripts/compare_advantages.py run --experiment-dir grpo_runs/advantage-200`
+依次执行整个流程，已完成且通过审计的训练阶段会复用。
+DeepSeek 的专用 thinking 参数可通过 `JUDGE_API_PROVIDER=deepseek` 启用对应接口；默认 provider 为 `openai` 兼容接口。
+
+每步 `256 / 8 = 32` 条不同训练题目，200 步固定为 **6,400 条去重题目**，无放回选出后写入本地数据集。
+两次训练关闭数据 shuffle，逐步按冻结顺序读取；批内排列使用独立随机数生成器，不受模型/advantage 消耗随机数影响。
+每个 rank 实际使用的题目 ID、预处理后 prompt 摘要和批内排列都会记录；训练结束后逐步比较。
+`data_order_audit.json` 未通过就阻止生成和裁判。生成回答会随训练后的策略变化，这是 on-policy 实验本身的差异。
+
+默认 **200 道 test 题目**也单独冻结，按规范化的完整上下文及首个 user 问题去重并排除训练重合。
+两模型用相同题目顺序、模板、截断和生成参数，默认 greedy 解码。
+裁判对每题匿名评 A/B 和 B/A，共 400 次逻辑评审（失败重试可能增加请求），
+胜/平/负记 1/0.5/0，按题目取两个顺序的平均分，再按题目做 2,000 次本地 bootstrap。
+顺序分歧、真正平局和 API/解析失败分开记录，失败不会当平局；默认全部评审有效才通过。
+
+最终看 `grpo_runs/advantage-200/comparison_result.json`：`improved_mean_score` 大于 0.5 倾向改进方法，
+结合 `improved_score_ci95`、有效数量和顺序分歧判断；区间包含 0.5 时不能据此判优。
+这只是单个训练 seed、200 步的初步实验，置信区间不覆盖训练 seed 的波动。
+独立重跑裁判会复用有效缓存，只重试失败项。训练中断后可用
+`train --experiment-dir grpo_runs/advantage-200 --restart-failed` 归档失败的训练及旧评测产物，
+该组重新从预训练权重开始；另一组完成的训练可复用，不会静默从中间 checkpoint 续训。
+
 ### 四卡效率与运行方式
 
-同步 GRPO 的每轮仍按“同步权重 → 生成 → 奖励 → 策略更新”执行；分工独立的 GPU 会等待其它阶段，
-因此四卡拆分不意味着四卡持续满负载。已有 Gloo 对象通信、QRM 长度分桶/动态 token 预算、
-训练 padding 裁剪和阶段计时继续保留。本次进一步取消 `log_completions=false` 时的两次全文 all-gather，
-并将普通 loss 指标通信从每 micro-step 的 3–4 次合为 1 次，让 ranking 共用同一四卡启动流程。
-数据预处理按 rank 共享缓存，只处理本次需要的 split，避免多卡重复 tokenize。
+2026-09-30 的同配置四步实测：总训练耗时从 **494.72 s 降到 448.13 s（减少 9.42%）**，
+生成 token 总数相差约 0.04%，按总训练时间计算的 completion 吞吐提高 10.35%。
+训练、末尾验证和产物检查均通过；这是短对照结果，未验证完整 800 step 的加速比例。
+配置、阶段数据和复现命令见 [四卡吞吐对照](docs/EVALUATION_ZH.md#四卡吞吐优化与对照2026-09-30)。
+
+每轮仍先同步权重和生成回答，再完成评分与策略更新。四卡 recipe 通过
+`overlap_qrm_reference: true`，在 GPU 5 执行同一 rollout 的 QRM 评分期间，让 GPU 6–7
+提前计算 KL 所需的参考模型 log-probabilities；之后策略 loss 直接使用缓存。
+这段重叠期间不更新策略，不引入上一轮的样本或分数，模型版本与串行计算一致。
+通用 `GRPOConfig` 的开关默认仍为 `false`，命令行可显式启用或回退：
+
+```bash
+OVERLAP_QRM_REFERENCE=1 python scripts/grpo.py train
+OVERLAP_QRM_REFERENCE=0 python scripts/grpo.py train  # 串行对照 / 回退
+```
+
+仅在分布式训练、单个 `qrm_server`、`beta > 0`、单次迭代、每卡 micro-batch 为 1、
+padding 裁剪开启且 generation batch 与 optimizer step 对齐时重叠。
+验证阶段、参考模型同步、Liger、FSDP、非 ZeRO-2 的 DeepSpeed、dropout 未禁用或参考模型配置中
+存在非零 attention dropout 时自动回退到串行路径。当前重叠路径仅支持已验证的 dense Qwen2/Qwen3
+参考模型及默认 RoPE；其它架构和非默认 RoPE scaling 也回退，避免状态依赖带来评分变化。
+不支持的训练配置会在主进程提示一次。
+
+已有 Gloo 对象通信、QRM 长度分桶/动态 token 预算、训练 padding 裁剪和阶段计时继续保留。
+completion token/长度和 loss 指标批量复制到 CPU，避免逐标量 GPU 同步；温度为 1 时跳过
+整个 logits 张量的除法。vLLM 设置 `detokenize=False`，只返回训练所需的 token IDs，
+文本由 Trainer 统一解码。`log_completions=false` 时省去两次全文 all-gather，普通 loss 的
+指标通信从每个 micro-step 的 3–4 次合为 1 次。数据预处理按 rank 共享缓存，只处理所需 split。
+这些改动减少等待和重复工作，四卡仍会随生成、评分和更新阶段出现不同利用率。
+
+当前保留 `REWARD_BATCH_SIZE=4` 和 `VLLM_MAX_NUM_SEQS=256`。QRM 对同一批 256 条回答、
+固定 6144 token 预算，分别预热一轮后测量三轮：batch 4/8 的评分耗时中位数为
+30.5960/30.7880 秒；batch 8 相对 batch 4 的奖励最大绝对差为 0.00905597，平均绝对差为
+0.00210910。因此保留 batch 4，批处理引入的 BF16 数值差异也不用于估计评分噪声。
+vLLM 在固定 KV-cache 预算下的一轮比较中，序列并发上限 256/128/64 的生成吞吐约为
+4708/4162/3288 token/s；三次生成的输出长度不同，不能当作相同生成轨迹上的精确加速比。
+`VLLM_MAX_NUM_SEQS` 可按显存和 KV-cache 抢占情况调整，最终值会写入本次 `run.env`。
 
 默认保留 ZeRO-2。LoRA 仅更新少量参数，可对照 DDP：
 
@@ -147,9 +229,11 @@ chat 会移除最后一个用户问题之后的参考 assistant 回答，保留�
 ACCELERATE_CONFIG=recipes/accelerate_configs/ddp_2gpus.yaml python scripts/grpo.py train
 ```
 
-显存允许时可尝试 `PER_DEVICE_TRAIN_BATCH_SIZE=2 GRADIENT_ACCUMULATION_STEPS=64`，
-保持默认全局 generation batch 256；这减少 micro-step 次数，但需要在目标长度下验证显存。
-不要只减少 accumulation 后将不同全局 batch 的实验称作同条件加速。
+`PER_DEVICE_TRAIN_BATCH_SIZE=2 GRADIENT_ACCUMULATION_STEPS=64` 虽然保持全局
+generation batch 256，并减少 micro-step 数量，但 BNPO 按每个 micro-batch 的有效 token 数归一化，
+改变 micro-batch 会改变变长回答的相对权重，也会关闭上述 QRM/reference 重叠。
+因此这组设置属于需要重新检查目标函数权重和显存的实验配置，不能视为严格同目标的加速对照。
+只减少 accumulation 导致全局 batch 改变时，也不能将吞吐差异称为同条件加速。
 用 `validation_report.json` 中每 rank 的阶段耗时定位瓶颈，再比较同模型、数据、长度、全局 batch
 和预热后多个 step 的吞吐。历史一小时监控中 GPU 4–7 平均利用率约为
 24.9% / 18.1% / 43.4% / 94.1%，旧日志没有阶段计时，不能据此解释为有效训练计算或推算提速倍数。
@@ -320,8 +404,12 @@ both `REWARD_BATCH_SIZE` and `QRM_MAX_BATCH_TOKENS`; results are restored to
 their original order. Policy micro-batches also discard prompt/completion
 columns that are padding for every sample in that micro-batch. Stage timing is
 enabled in this recipe: `timing/rollout_total_*`, `timing/qrm_total_*`,
-`timing/external_sync_wait_*`, and `timing/policy_train_total_*` expose per-rank,
-minimum, maximum, and rank-spread wall times in the normal Trainer logs. The
+`timing/reference_precompute_*`, `timing/external_sync_wait_*`, and
+`timing/policy_train_total_*` expose per-rank, minimum, maximum, and rank-spread
+wall times in the normal Trainer logs. With reference overlap enabled,
+`qrm_service` and `reference_precompute` cover concurrent work; adding them
+does not give the elapsed QRM phase time. Use `qrm_total` and complete-step
+wall time for throughput comparisons. The
 `*_total_*` policy metrics sum all accumulation micro-steps in one optimizer
 step; the accompanying `*_mean_*` metrics retain the per-micro-step average.
 
@@ -348,6 +436,8 @@ bash train_scripts/qwen3_1.7_grpo_ranking_chat.sh
 | `RESUME_FROM_CHECKPOINT` | Explicit checkpoint path for resuming into a new run directory |
 | `GRPO_CACHE_ROOT`, `GRPO_DATA_ROOT`, `HF_HOME`, `HF_HUB_CACHE` | Cache location; explicit paths win, otherwise a writable `/data/<user>/cache/grpo` is preferred before the home-directory fallback |
 | `VLLM_TMPDIR` | Optional short vLLM IPC directory; the launcher otherwise creates and cleans `/tmp/grpo-vllm.*` |
+| `VLLM_MAX_NUM_SEQS` | vLLM concurrent sequence cap; defaults to 256 and is recorded in `run.env` |
+| `OVERLAP_QRM_REFERENCE` | Set 1 to overlap QRM scoring and reference log-probs, or 0 for serial execution; guarded overlap is enabled in the four-GPU recipe |
 | `NUM_GENERATIONS`, `PER_DEVICE_TRAIN_BATCH_SIZE`, `GRADIENT_ACCUMULATION_STEPS` | Batch configuration; generation batch is derived unless explicitly supplied |
 | `MAX_STEPS`, `MAX_PROMPT_LENGTH`, `MAX_COMPLETION_LENGTH`, `REWARD_BATCH_SIZE` | Training scale and memory controls; QRM accepts at most 4 examples per dynamic batch by default |
 | `QRM_MAX_LENGTH`, `QRM_MAX_BATCH_TOKENS`, `QRM_REQUEST_TIMEOUT`, `QRM_STARTUP_TIMEOUT` | Reward context, padded-token budget (default 6144), and bounded request/startup waits |

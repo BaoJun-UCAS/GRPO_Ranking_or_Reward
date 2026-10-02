@@ -33,6 +33,9 @@ use_vllm: true
 vllm_mode: server
 use_cpu_object_collectives: true
 trim_unused_padding: true
+# Reuse idle policy GPUs during QRM scoring; unsupported configurations fall back to serial scoring.
+overlap_qrm_reference: true
+disable_dropout: true
 profile_stage_timings: true
 vllm_server_base_url: http://127.0.0.1:${VLLM_HTTP_PORT}
 vllm_group_port: ${VLLM_GROUP_PORT}

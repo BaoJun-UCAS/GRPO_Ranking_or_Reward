@@ -223,6 +223,14 @@ class GRPOConfig(trl.GRPOConfig):
         default=False,
         metadata={"help": "Trim all-padding prompt/completion columns after splitting generation micro-batches."},
     )
+    overlap_qrm_reference: bool = field(
+        default=False,
+        metadata={"help": "Overlap the single external QRM request with reference scoring on supported training paths."},
+    )
+    training_schedule_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Optional version-1 frozen prompt schedule with independent microbatch ordering and per-rank audit traces."},
+    )
     profile_stage_timings: bool = field(
         default=False,
         metadata={"help": "Log per-rank rollout, reward, synchronization, and policy-step wall times."},

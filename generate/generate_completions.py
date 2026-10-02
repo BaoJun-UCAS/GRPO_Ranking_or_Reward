@@ -21,7 +21,10 @@ from pathlib import Path
 from importlib.metadata import version
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from open_r1.evaluation import ARTIFACT_VERSION, digest, model_fingerprint, valid_generation_cache, prompt_token_ids
+from open_r1.evaluation import (
+    ARTIFACT_VERSION, digest, model_fingerprint, valid_generation_cache, prompt_token_ids,
+    load_frozen_prompts, frozen_prompt_messages, frozen_prompt_text,
+)
 
 
 def load_validation_prompts(num_prompts: int, seed: int, model_path: str = None, dataset_override: str = None,
@@ -138,13 +141,10 @@ def load_validation_prompts(num_prompts: int, seed: int, model_path: str = None,
     return validation_prompts, golden_completions, dataset_type, split_name, dataset_info
 
 
-def format_prompt(user_message: str, tokenizer, dataset_type: str = "ultrachat", system_prompt: Optional[str] = "", enable_thinking: bool = False) -> str:
+def format_prompt(user_message: Any, tokenizer, dataset_type: str = "ultrachat", system_prompt: Optional[str] = "", enable_thinking: bool = False) -> str:
     # None omits the system message; an empty string preserves the training
     # recipe's explicit empty system message. Do not invent task instructions.
-    messages = []
-    if system_prompt is not None:
-        messages.append({"role": "system", "content": system_prompt})
-    messages.append({"role": "user", "content": user_message})
+    messages = frozen_prompt_messages(user_message, system_prompt)
     prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=enable_thinking)
     return prompt
 
@@ -193,6 +193,7 @@ def main():
     parser = argparse.ArgumentParser(description="Generate completions artifact for single model")
     parser.add_argument("--model", required=True, help="Path to model directory (HF path or local directory)")
     parser.add_argument("--revision", default="main")
+    parser.add_argument("--prompts-file", help="Frozen held-out JSON v1; preserve its order and require --num-prompts to match")
     parser.add_argument("--dataset-id")
     parser.add_argument("--dataset-split")
     parser.add_argument("--prompt-column")
@@ -217,6 +218,11 @@ def main():
         parser.error("Prompt/completion counts and token limits must be positive")
     if not math.isfinite(args.temperature) or not 0 <= args.temperature or not 0 < args.top_p <= 1 or not 0 < args.vllm_gpu_memory <= 1:
         parser.error("Invalid temperature, top-p or GPU memory fraction")
+    if args.prompts_file and any((args.dataset, args.dataset_id, args.dataset_split, args.prompt_column)):
+        parser.error("--prompts-file cannot be combined with dataset selection arguments")
+    frozen_prompts = frozen_identity = None
+    if args.prompts_file:
+        frozen_prompts, frozen_identity = load_frozen_prompts(args.prompts_file, args.num_prompts)
     from transformers import AutoTokenizer, AutoModelForCausalLM
     from tqdm import tqdm
     import torch
@@ -244,9 +250,17 @@ def main():
     torch.manual_seed(args.seed)
 
     # Load prompts
-    prompts, golden_completions, dataset_type, split_name, dataset_info = load_validation_prompts(
-        args.num_prompts, args.seed, args.model, args.dataset, args.dataset_id, args.dataset_split,
-        args.prompt_column, args.dataset_revision)
+    if frozen_prompts is not None:
+        prompts, golden_completions = frozen_prompts, None
+        dataset_type, split_name = "frozen", "heldout"
+        dataset_info = {"frozen_prompts": frozen_identity}
+    else:
+        prompts, golden_completions, dataset_type, split_name, dataset_info = load_validation_prompts(
+            args.num_prompts, args.seed, args.model, args.dataset, args.dataset_id, args.dataset_split,
+            args.prompt_column, args.dataset_revision)
+    artifact_prompts = [frozen_prompt_text(prompt, system_prompt) for prompt in prompts]
+    if frozen_identity is not None and len(set(artifact_prompts)) != len(artifact_prompts):
+        raise ValueError("Frozen prompts become duplicates after the system-prompt override")
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=False)
     formatted_prompts = [format_prompt(p, tokenizer, dataset_type, system_prompt, args.enable_thinking) for p in prompts]
     token_prompts = prompt_token_ids(tokenizer, formatted_prompts, args.max_prompt_length)
@@ -257,11 +271,13 @@ def main():
                 "temperature": args.temperature, "top_p": args.top_p, "seed": args.seed,
                 "n_completions": args.n_completions, "backend": "vllm" if use_vllm else "transformers",
                 "versions": {name: version(name) for name in ("torch", "transformers", "vllm") if name != "vllm" or use_vllm}}
+    if frozen_identity is not None:
+        contract["frozen_prompts"] = frozen_identity
     if args.reuse_existing:
         if not args.output or not args.output.endswith(".json"):
             parser.error("--reuse-existing requires an explicit --output .json file")
         if Path(args.output).exists():
-            if valid_generation_cache(args.output, contract, prompts, args.n_completions):
+            if valid_generation_cache(args.output, contract, artifact_prompts, args.n_completions):
                 print(f"Reusing validated completions: {args.output}")
                 return
             raise ValueError("Existing completions do not match this model/data/configuration. Use a new evaluation directory; old evidence was preserved.")
@@ -328,8 +344,11 @@ def main():
     items: List[Dict[str, Any]] = []
     if len(completions) != len(prompts) or any(len(c) != args.n_completions for c in completions):
         raise ValueError("Generation returned an incomplete result; artifact was not published")
-    for p, c in zip(prompts, completions):
-        items.append({"prompt": p, "completions": c})
+    for index, (p, c) in enumerate(zip(artifact_prompts, completions)):
+        item = {"prompt": p, "completions": c}
+        if frozen_identity is not None:
+            item["prompt_id"] = frozen_identity["prompt_ids"][index]
+        items.append(item)
 
     meta: Dict[str, Any] = {
         "artifact_version": ARTIFACT_VERSION,

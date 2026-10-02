@@ -57,3 +57,111 @@ def prompt_token_ids(tokenizer, formatted_prompts, max_prompt_length):
     """Both inference backends see exactly the same left-truncated token IDs."""
     return [tokenizer(text, add_special_tokens=False)["input_ids"][-max_prompt_length:]
             for text in formatted_prompts]
+
+
+def frozen_prompt_messages(prompt, system_prompt=None):
+    """Validate text/chat prompts and apply the same system override as training."""
+    if isinstance(prompt, str):
+        if not prompt.strip():
+            raise ValueError("Frozen prompts must not be empty")
+        messages = [{"role": "user", "content": prompt}]
+    elif isinstance(prompt, list) and prompt:
+        messages = []
+        expected_role = "user"
+        for index, message in enumerate(prompt):
+            if not isinstance(message, dict) or set(message) != {"role", "content"}:
+                raise ValueError("Frozen chat messages require exactly role and content")
+            role, content = message["role"], message["content"]
+            if not isinstance(content, str):
+                raise ValueError("Frozen chat message content must be text")
+            if role == "system" and index == 0:
+                messages.append(dict(message))
+                continue
+            if role != expected_role:
+                raise ValueError("Frozen chats require alternating user/assistant messages, with an optional first system")
+            messages.append(dict(message))
+            expected_role = "assistant" if role == "user" else "user"
+        if messages[-1]["role"] != "user" or not messages[-1]["content"].strip():
+            raise ValueError("Frozen chat prompts must end with a nonempty user message")
+    else:
+        raise ValueError("Frozen prompts must be nonempty text or chat message lists")
+    if system_prompt is not None:
+        if not isinstance(system_prompt, str):
+            raise ValueError("system_prompt must be text or null")
+        system = {"role": "system", "content": system_prompt}
+        if messages[0]["role"] == "system":
+            messages[0] = system
+        else:
+            messages.insert(0, system)
+    return messages
+
+
+def frozen_prompt_text(prompt, system_prompt=None):
+    """Human-readable judge input; retain all turns for conversational prompts."""
+    if isinstance(prompt, str):
+        return prompt
+    return json.dumps(frozen_prompt_messages(prompt, system_prompt), ensure_ascii=False, indent=2)
+
+
+def load_frozen_prompts(path, num_prompts):
+    """Read an immutable ordered held-out sample shared by both candidate models."""
+    raw = Path(path).read_bytes()
+    payload = json.loads(raw)
+    if not isinstance(payload, dict) or type(payload.get("version")) is not int or payload["version"] != 1:
+        raise ValueError("Frozen prompts require version=1")
+    prompts, prompt_ids = payload.get("prompts"), payload.get("prompt_ids")
+    if not isinstance(prompts, list) or not prompts or len(prompts) != num_prompts:
+        raise ValueError("--num-prompts must exactly match the frozen prompts file length")
+    if not isinstance(prompt_ids, list) or len(prompt_ids) != len(prompts):
+        raise ValueError("Frozen prompt_ids must match prompts in length")
+    if any(not isinstance(value, str) or not value.strip() for value in prompt_ids):
+        raise ValueError("Frozen prompt_ids must be nonempty strings")
+    if len(set(prompt_ids)) != len(prompt_ids):
+        raise ValueError("Frozen prompt_ids must be unique")
+    if payload.get("prompts_sha256") != digest(prompts):
+        raise ValueError("Frozen prompts_sha256 integrity check failed")
+    for prompt in prompts:
+        frozen_prompt_messages(prompt)
+    if len({digest(prompt) for prompt in prompts}) != len(prompts):
+        raise ValueError("Frozen prompts must be unique for prompt-level bootstrap")
+    identity = {
+        "version": 1,
+        "file_sha256": hashlib.sha256(raw).hexdigest(),
+        "prompts_sha256": payload["prompts_sha256"],
+        "prompt_ids": prompt_ids,
+    }
+    return prompts, identity
+
+
+def combine_order_judgments(order_results):
+    """Reduce two opposite-order judgments to one prompt cluster.
+
+    Scores average wins=1, ties=0.5, losses=0 across presentation orders. A
+    disagreement remains distinct from an explicit tie. Any missing verdict
+    invalidates that endpoint for this prompt instead of becoming a tie.
+    """
+    if len(order_results) != 2 or {result.get("order_swapped") for result in order_results} != {False, True}:
+        raise ValueError("Both opposite presentation orders are required")
+    combined = {
+        "order_judgments": order_results,
+        "prompt": order_results[0]["prompt"],
+        "model1_completion": order_results[0]["model1_completion"],
+        "model2_completion": order_results[0]["model2_completion"],
+        "source_index": order_results[0]["source_index"],
+    }
+    score = {"model1": 1.0, "model2": 0.0, "tie": 0.5}
+    for endpoint in ("overall", "survey"):
+        winners = [result.get(f"{endpoint}_winner") for result in order_results]
+        valid = all(winner in score for winner in winners)
+        if endpoint == "overall":
+            valid = valid and not any(result.get("overall_parsing_failed", True) for result in order_results)
+        if not valid:
+            outcome, model1_score = "failed", None
+        else:
+            outcome = winners[0] if winners[0] == winners[1] else "order_disagreement"
+            model1_score = sum(score[winner] for winner in winners) / 2
+        combined[f"{endpoint}_winner"] = outcome if valid else None
+        combined[f"{endpoint}_parsing_failed"] = not valid
+        combined[f"{endpoint}_model1_score"] = model1_score
+        combined[f"{endpoint}_model2_score"] = 1 - model1_score if valid else None
+    return combined
