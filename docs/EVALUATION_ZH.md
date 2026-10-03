@@ -328,3 +328,63 @@ PYTHONPATH=src CUDA_VISIBLE_DEVICES= MPLBACKEND=Agg python -m pytest -q tests/
 绘图拒绝无效评测或缺少有效比较的报告；直接读取结果 JSON，不依赖特定模型名称或 checkpoint 文件名。旧多温度绘图入口的本地依赖也已补齐，遇到同一 checkpoint 的多份冲突结果会报错，避免按目录遍历顺序静默覆盖。
 
 本轮回归覆盖解析异常、API/格式失败、缓存身份变化、生成主流程（模拟两种后端）、记录不覆盖、仅训练末尾验证、shell 退出状态以及实际 CPU PNG 输出。由于 GPU 被其他用户占用，没有进行修复后真实 GPU 生成或付费 API 验收；已有训练权重无需重训。
+
+## 任务导向裁判协议 v3 与旧结果离线重解析
+
+`survey-v3-task-focused` 将正确性和任务完成度作为 Overall 的优先依据，明确允许
+“没有有意义的质量差别”的平局，避免因长度、文风、排版或高级词汇强行判胜。
+`complexity` 字段为兼容旧报表保留，但含义改为“任务所需的适当深度”，不奖励复杂本身。
+Overall 是主指标；五维等权 survey vote 仅为辅助诊断，不代替 Overall。
+
+新版 `bootstrap_judge.py` 默认允许平局；`--no-ties` 仍可显式要求强制选择。
+推荐继续使用 `--judge-both-orders --allow-ties`，按题合并两次胜/平/负得分后做题目级 bootstrap。
+缺失/无效判断不会变成平局；默认 `--min-valid-fraction 1.0`，两个 endpoint 都要求全部题目有效。
+
+裁判采样温度默认为 `--judge-temperature 0`，可传 0–2 的有限值（Anthropic 为 0–1）；
+`--judge-temperature default` 不发送温度。低温减少采样噪声，不保证服务端完全确定。
+现有 GPT-5 分支与 DeepSeek thinking=enabled 分支保持不发送温度的兼容行为；
+报表分别记录请求温度、实际发送参数和省略原因。对照实验入口支持 `JUDGE_TEMPERATURE`
+覆盖 `judge.temperature`，例如：
+
+```bash
+# 此命令调用真实裁判 API，可能付费；需已有 JUDGE_MODEL/JUDGE_API_KEY 等配置
+JUDGE_TEMPERATURE=0 python scripts/compare_advantages.py judge --experiment-dir grpo_runs/advantage-200
+```
+
+缓存键包含协议、解析器、cache 版本、实际 prompt 哈希、模型/endpoint、顺序、tie 策略、thinking
+与温度/实际请求参数。对照入口的目录和直接 CLI 的报告名也包含协议/设置标识，避免覆盖旧协议报告。
+升级后真实裁判不会复用旧协议缓存，因此会产生新的 API 调用；不要以为升级解析器就运行过新提示词。
+旧实验已完成的训练、回答文件可继续用于 standalone `judge`；不要编辑冻结的实验 manifest。
+
+### 顺序诊断
+
+`validation.observed.{overall,survey}_analysis.order_diagnostics` 增加：
+
+- `pure_reversal`：两顺序分别判相反模型胜
+- `tie_win_change`：一个顺序平局、另一个顺序某模型胜
+- `stable_tie`：两个顺序都是明确平局
+- `stable_model1_win` / `stable_model2_win` / `invalid`：稳定胜者或无效题目
+- `presentation_position`：按展示 A/B 统计胜、平、有效判断数，以及两顺序都选 A/B 的题数
+
+展示位置统计按有效单次判断计数，可能包含无效题目中仍有效的另一半；其分母与主指标有效题数
+分别报告。以上只描述顺序敏感性，不能据此断言位置偏好或随机性造成了分歧。
+主指标仍是每题两个顺序的平均得分，置信区间仍按题目聚类，不把 2N 次判断当成独立样本。
+
+### 不调用 API，重新解析历史原文
+
+```bash
+python evaluate/reparse_judgments.py \
+  --input /path/to/original_both_orders_bootstrap.json \
+  --output /path/to/NEW_parser_v3_reanalysis.json
+```
+
+输入必须包含保存的原始 `raw_response`、顺序和 bootstrap `sample_positions`。
+输出必须是尚不存在的新文件；拒绝覆盖输入、既有文件或符号链接。
+该工具不读取/写入 judge cache、不创建 API client、不重选题目、不重新采样。
+它保留原始协议配置、原始决策、原始摘要、原文哈希、源文件 SHA256 和每次 bootstrap 的原有抽样位置。
+输出明确标为 `offline_parser_only_reanalysis`，`new_prompt_executed=false`；只应用新版解析器，
+不声称运行了新版 rubric。原始 API 失败不能通过重解析恢复，仍按无效处理。
+
+解析器接受独立 Winner 行上的 `A` / `[A]` / `Response A` / `[Response A]`（B 同理）、
+允许平局时的 `Tie`，及单层、短且不包含其他判胜标签的括号尾注。
+重复或矛盾 Winner/Overall 标题、A/B 组合、普通散文中的字母，以及缺失维度会严格失败。

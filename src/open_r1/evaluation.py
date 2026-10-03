@@ -153,15 +153,78 @@ def combine_order_judgments(order_results):
     for endpoint in ("overall", "survey"):
         winners = [result.get(f"{endpoint}_winner") for result in order_results]
         valid = all(winner in score for winner in winners)
-        if endpoint == "overall":
-            valid = valid and not any(result.get("overall_parsing_failed", True) for result in order_results)
+        valid = valid and not any(result.get(f"{endpoint}_parsing_failed", endpoint == "overall")
+                                  for result in order_results)
         if not valid:
             outcome, model1_score = "failed", None
         else:
             outcome = winners[0] if winners[0] == winners[1] else "order_disagreement"
             model1_score = sum(score[winner] for winner in winners) / 2
+        if not valid:
+            order_outcome = "invalid"
+        elif winners[0] == winners[1]:
+            order_outcome = "stable_tie" if winners[0] == "tie" else f"stable_{winners[0]}_win"
+        elif "tie" in winners:
+            order_outcome = "tie_win_change"
+        else:
+            order_outcome = "pure_reversal"
+        combined[f"{endpoint}_order_outcome"] = order_outcome
         combined[f"{endpoint}_winner"] = outcome if valid else None
         combined[f"{endpoint}_parsing_failed"] = not valid
         combined[f"{endpoint}_model1_score"] = model1_score
         combined[f"{endpoint}_model2_score"] = 1 - model1_score if valid else None
     return combined
+
+
+def order_diagnostics(results, endpoint):
+    """Descriptive order sensitivity and displayed-position choices, not causality.
+
+    Cluster categories require both valid orders. Position statistics use each
+    valid order judgment, including a valid half of an invalid cluster; their
+    denominator is reported separately and is never used for the primary score.
+    """
+    categories = ("stable_model1_win", "stable_model2_win", "stable_tie", "pure_reversal", "tie_win_change", "invalid")
+    counts = dict.fromkeys(categories, 0)
+    position = {"A_wins": 0, "B_wins": 0, "ties": 0, "invalid_judgments": 0}
+    always_a = always_b = paired = 0
+    for result in results:
+        orders = result.get("order_judgments", [result])
+        if len(orders) == 2:
+            paired += 1
+            # Recompute rather than trusting stale categories in saved reports.
+            combined = combine_order_judgments(orders)
+            counts[combined[f"{endpoint}_order_outcome"]] += 1
+        labels = []
+        for order in orders:
+            winner = order.get(f"{endpoint}_winner")
+            if (winner not in ("model1", "model2", "tie")
+                    or order.get(f"{endpoint}_parsing_failed", False)
+                    or not isinstance(order.get("order_swapped"), bool)):
+                position["invalid_judgments"] += 1
+                labels.append(None)
+            elif winner == "tie":
+                position["ties"] += 1
+                labels.append("tie")
+            else:
+                label = "A" if (winner == "model1") != order["order_swapped"] else "B"
+                position[f"{label}_wins"] += 1
+                labels.append(label)
+        if len(orders) == 2:
+            always_a += labels == ["A", "A"]
+            always_b += labels == ["B", "B"]
+    valid_calls = position["A_wins"] + position["B_wins"] + position["ties"]
+    decisive_calls = position["A_wins"] + position["B_wins"]
+    position.update({
+        "valid_judgments": valid_calls,
+        "decisive_judgments": decisive_calls,
+        "A_win_fraction_decisive": position["A_wins"] / decisive_calls if decisive_calls else None,
+        "A_mean_score": (position["A_wins"] + 0.5 * position["ties"]) / valid_calls if valid_calls else None,
+        "both_orders_choose_A": always_a,
+        "both_orders_choose_B": always_b,
+    })
+    return {
+        "paired_prompt_clusters": paired,
+        "pair_outcomes": counts,
+        "presentation_position": position,
+        "interpretation": "Descriptive sensitivity to order. Reversals, tie changes, or position preference do not establish their cause.",
+    }

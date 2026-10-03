@@ -69,6 +69,7 @@ Set environment variables before invoking this script:
   MERGE_AFTER_TRAINING=1        Set 0 to retain only the LoRA adapter
   WANDB_MODE=offline WANDB_PROJECT=GRPO
   PYTHON=python                Interpreter from the active environment
+  TRAINING_ENTRYPOINT          Optional Python entry; defaults to src/open_r1/grpo.py
 
 Example (GPU 4 rollout, GPU 5 QRM, GPUs 6-7 training):
   DATASET_NAME=owner/UltraChat-200k VLLM_GPUS=4 QRM_GPU=5 TRAIN_GPUS=6,7 \
@@ -90,6 +91,8 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 cd "${PROJECT_ROOT}"
 PYTHON="${PYTHON:-python}"
+TRAINING_ENTRYPOINT="${TRAINING_ENTRYPOINT:-src/open_r1/grpo.py}"
+[[ -f "${TRAINING_ENTRYPOINT}" ]] || { echo "Training entry not found: ${TRAINING_ENTRYPOINT}" >&2; exit 2; }
 
 # Default: GPU 4 serves vLLM, GPU 5 serves QRM, and GPUs 6-7 train.
 # Reject the old singular alias so a stale VLLM_GPU=0 cannot silently defeat
@@ -429,7 +432,7 @@ echo "Starting ${NUM_TRAIN_GPUS}-GPU policy training on physical GPUs ${TRAIN_GP
 run_logged "${OUTPUT_DIR}/logs/training.log" \
     env CUDA_VISIBLE_DEVICES="${TRAIN_GPUS}" ACCELERATE_LOG_LEVEL=info "${PYTHON}" -m accelerate.commands.launch \
     --config_file "${RESOLVED_ACCELERATE_CONFIG}" --main_process_port "${PORT}" \
-    --num_processes "${NUM_TRAIN_GPUS}" src/open_r1/grpo.py --config "${PROCESSED_CONFIG}"
+    --num_processes "${NUM_TRAIN_GPUS}" "${TRAINING_ENTRYPOINT}" --config "${PROCESSED_CONFIG}"
 
 echo "Validating training artifacts and pipeline timings"
 "${PYTHON}" "${VALIDATOR}" "${OUTPUT_DIR}" --allow-running 2>&1 \

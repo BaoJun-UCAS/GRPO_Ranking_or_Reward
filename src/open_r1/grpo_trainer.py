@@ -56,6 +56,7 @@ from trl.models.utils import _ForwardRedirection
 from trl.trainer.callbacks import SyncRefModelCallback
 from .configs import GRPOConfig
 from .advantages import compute_advantages, configure_advantage
+from .rolling_advantages import RollingQuantilePairwise
 from .objectives import reduce_policy_loss
 from .training_schedule import TrainingSchedule, append_schedule_trace, permute_rollout_payload
 from trl.trainer.utils import (
@@ -478,6 +479,9 @@ class GRPOTrainer(Trainer):
             getattr(args, "advantage_kwargs", None),
             scale_rewards=args.scale_rewards,
         )
+        if isinstance(self.advantage_estimator, RollingQuantilePairwise):
+            from .rolling_advantage_state import RollingAdvantageStateCallback
+            callbacks = list(callbacks or []) + [RollingAdvantageStateCallback(self.advantage_estimator)]
 
         # Models
         # Trained model
@@ -858,6 +862,18 @@ class GRPOTrainer(Trainer):
 
             # Initialize data collection structures
             self.reward_data_buffer = []  # Buffer for current training step batch
+
+    def train(self, resume_from_checkpoint=None, trial=None, ignore_keys_for_eval=None, **kwargs):
+        if isinstance(self.advantage_estimator, RollingQuantilePairwise) and resume_from_checkpoint:
+            checkpoint = resume_from_checkpoint
+            if checkpoint is True:
+                from transformers.trainer_utils import get_last_checkpoint
+                checkpoint = get_last_checkpoint(self.args.output_dir)
+                if checkpoint is None:
+                    raise ValueError("No checkpoint found for rolling advantage resume")
+            self.advantage_estimator.load(checkpoint)
+        return super().train(resume_from_checkpoint=resume_from_checkpoint, trial=trial,
+                             ignore_keys_for_eval=ignore_keys_for_eval, **kwargs)
 
     def _collect_reward_data(self, prompts, completions, rewards, global_step):
         """Collect reward data for saving to files."""
@@ -1771,11 +1787,14 @@ class GRPOTrainer(Trainer):
 
         # Advantage estimators always receive complete global groups, including
         # groups whose completions straddle distributed rank boundaries.
+        advantage_options = dict(self.advantage_kwargs)
+        if isinstance(self.advantage_estimator, RollingQuantilePairwise):
+            advantage_options.update(step=self.state.global_step, update_history=(mode == "train"))
         advantage_result = compute_advantages(
             rewards,
             self.num_generations,
             method=self.advantage_estimator,
-            method_kwargs=self.advantage_kwargs,
+            method_kwargs=advantage_options,
             rewards_per_func=rewards_per_func,
             reward_weights=self.reward_weights.to(device),
         )
@@ -1783,6 +1802,9 @@ class GRPOTrainer(Trainer):
         std_grouped_rewards = advantage_result.group_std
         is_std_zero = torch.isclose(std_grouped_rewards, torch.zeros_like(std_grouped_rewards))
         advantages = advantage_result.advantages
+        if isinstance(self.advantage_estimator, RollingQuantilePairwise):
+            for name, value in self.advantage_estimator.last_metrics.items():
+                self._metrics[mode][f"advantage/{name}"].append(value)
 
         # Slice to keep only the local part of the data
         process_slice = slice(

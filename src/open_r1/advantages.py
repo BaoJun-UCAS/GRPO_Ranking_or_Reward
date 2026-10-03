@@ -17,6 +17,8 @@ from typing import Any
 
 import torch
 
+from .rolling_advantages import RollingQuantilePairwise
+
 
 @dataclass(frozen=True)
 class AdvantageBatch:
@@ -202,6 +204,11 @@ def configure_advantage(
     """
     estimator = resolve_advantage(method)
     options = parse_advantage_kwargs(method_kwargs)
+    if estimator is RollingQuantilePairwise:
+        if scale_rewards is not True:
+            raise ValueError("rolling_quantile_pairwise requires scale_rewards=True for its standardized differences")
+        # Construct once per trainer; never reset historical state per batch.
+        return RollingQuantilePairwise(**options), {}
     if estimator in (studentization, rank_reward):
         if not isinstance(scale_rewards, bool):
             raise TypeError("scale_rewards must be a boolean")
@@ -271,7 +278,10 @@ def compute_advantages(
         rewards_per_func=components,
         reward_weights=reward_weights,
     )
-    advantages = resolve_advantage(method)(batch, **method_kwargs)
+    estimator = resolve_advantage(method)
+    if estimator is RollingQuantilePairwise:
+        raise ValueError("rolling_quantile_pairwise is stateful; use configure_advantage once and reuse its estimator")
+    advantages = estimator(batch, **method_kwargs)
     if not isinstance(advantages, torch.Tensor) or advantages.shape != grouped.shape:
         raise ValueError(f"Advantage estimator must return a tensor of shape {tuple(grouped.shape)}")
     if not advantages.is_floating_point() or advantages.device != rewards.device:
@@ -284,3 +294,6 @@ def compute_advantages(
         group_mean=batch.group_mean.squeeze(1),
         group_std=batch.group_std.squeeze(1),
     )
+
+
+register_advantage("rolling_quantile_pairwise")(RollingQuantilePairwise)

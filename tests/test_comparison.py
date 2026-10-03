@@ -45,6 +45,41 @@ def test_prepare_freezes_only_advantage_difference_and_detects_drift(experiment)
         comparison.verify_experiment(directory)
 
 
+def test_rolling_improved_prepare_preserves_baseline_and_uses_explicit_quantiles(experiment, tmp_path):
+    _, manifest = experiment
+    config = manifest['config'].copy()
+    config.pop('delta')
+    config.pop('c')
+    config.update(improved_advantage='rolling_quantile_pairwise',
+                  improved_advantage_kwargs={'p': .1, 'q': .05, 'window_size': 4, 'epsilon': .0001})
+    recipe = tmp_path / 'rolling.yaml'
+    recipe.write_text(yaml.safe_dump(config))
+    directory = tmp_path / 'rolling-paired'
+    rolling_manifest = comparison.prepare(recipe, directory)
+    comparison.verify_experiment(directory)
+    baseline, improved = [yaml.safe_load((directory / f'configs/{arm}.yaml').read_text())
+                          for arm in comparison.ARMS]
+    assert {k for k in baseline if baseline[k] != improved[k]} == {'advantage', 'advantage_kwargs'}
+    assert baseline['advantage'] == 'grpo' and baseline['advantage_kwargs'] == {}
+    assert improved['advantage'] == 'rolling_quantile_pairwise'
+    assert improved['advantage_kwargs'] == config['improved_advantage_kwargs']
+    assert rolling_manifest['config']['steps'] == config['steps']
+    env = comparison.training_environment(directory, rolling_manifest, 'improved')
+    result = subprocess.run([env['PYTHON'], str(comparison.ROOT / 'scripts/grpo.py'), 'train', '--dry-run'],
+                            env=env, capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert 'advantage: rolling_quantile_pairwise' in result.stdout
+    assert not (directory / 'improved').exists()
+
+
+def test_rolling_comparison_requires_explicit_valid_proportions():
+    with pytest.raises(ValueError, match='p and q'):
+        comparison.improved_spec({'improved_advantage': 'rolling_quantile_pairwise'})
+    with pytest.raises(ValueError, match='less than 1'):
+        comparison.improved_spec({'improved_advantage': 'rolling_quantile_pairwise',
+                                  'improved_advantage_kwargs': {'p': .6, 'q': .5}})
+
+
 def test_real_launcher_dry_runs_ignore_ambient_smoke_and_method_settings(experiment, monkeypatch):
     directory, manifest = experiment
     for name, value in {'ADVANTAGE': 'ranking', 'MAX_TRAIN_SAMPLES': '1', 'MAX_STEPS': '1',

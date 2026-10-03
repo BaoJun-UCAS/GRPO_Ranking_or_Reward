@@ -1,13 +1,12 @@
-# Both arms start independently from this same pretrained checkpoint.
+# NEW experiment only: historical robust_pairwise runs keep their original formula.
 steps: 200
 seed: 42
-model_name: Qwen/Qwen3-1.7B
+model_name: /data/baojun/cache/grpo/huggingface/hub/models--Qwen--Qwen3-1.7B/snapshots/70d244cc86ccca08cf5af4e1e306ecf908b1ad5e
 model_revision: 70d244cc86ccca08cf5af4e1e306ecf908b1ad5e
-qrm_model: friendshipkim/QRM-Llama3.1-8B-v2
+qrm_model: /data/baojun/cache/grpo/huggingface/hub/models--friendshipkim--QRM-Llama3.1-8B-v2/snapshots/23c6db70a35875248f45b3cfbe6d237ba8ac3e6d
 qrm_revision: 23c6db70a35875248f45b3cfbe6d237ba8ac3e6d
 training_recipe: recipes/Qwen3-1.7B/config_chat_regular_qrm_lora_4gpu_split.yaml
 accelerate_config: recipes/accelerate_configs/zero2_2gpus.yaml
-# Change these data fields before preparing a NEW experiment directory.
 data:
   source: /data/baojun/datasets/ultrachat_200k_grpo_seed42
   train_split: train
@@ -23,9 +22,13 @@ gradient_accumulation_steps: 128
 num_generations: 8
 max_prompt_length: 2048
 max_completion_length: 3072
-# Only advantage and advantage_kwargs differ between the arms.
-delta: 0.01
-c: 0.08
+improved_advantage: rolling_quantile_pairwise
+improved_advantage_kwargs:
+  # Illustrative experimental settings from the attachment, not calibrated defaults.
+  p: 0.05
+  q: 0.05
+  window_size: 32  # Prior GLOBAL rollouts; one rollout/step in this recipe.
+  epsilon: 0.0001
 services:
   vllm_gpus: "4"
   qrm_gpu: "5"
@@ -44,19 +47,15 @@ evaluation:
   num_prompts: 200
   seed: 31415
   gpu: "4"
-  # Greedy decoding removes additional response-sampling noise for this pilot.
   temperature: 0.0
   top_p: 1.0
   max_new_tokens: 3072
   vllm_gpu_memory: 0.85
   bootstrap_iterations: 2000
 judge:
-  # Supply JUDGE_MODEL, JUDGE_BASE_URL, JUDGE_API_KEY at runtime.
-  # Use JUDGE_API_PROVIDER=deepseek for its thinking-mode API extension.
   api_provider: openai
   model: null
   base_url: null
   thinking_mode: disabled
-  # Low-noise default; JUDGE_TEMPERATURE overrides it (or default to omit).
   temperature: 0.0
   max_retries: 3

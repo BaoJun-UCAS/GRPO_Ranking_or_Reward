@@ -21,12 +21,14 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from open_r1.evaluation import combine_order_judgments
+from open_r1.evaluation import combine_order_judgments, order_diagnostics
+from open_r1.judge_protocol import (
+    DEFAULT_JUDGE_TEMPERATURE, JUDGE_CACHE_VERSION, JUDGE_PARSER_VERSION, JUDGE_PROTOCOL_VERSION,
+    build_comparison_prompt, judge_request_parameters, judge_settings_metadata,
+)
 from typing import List, Dict, Any, Optional, Tuple
 from tqdm import tqdm
 
-JUDGE_PROTOCOL_VERSION = "survey-v2-strict-sections"
-JUDGE_PARSER_VERSION = "2"
 
 # NumPy for statistical calculations
 try:
@@ -364,53 +366,84 @@ def generate_output_filename(model1_path: str, model2_path: str, judge_model: st
 
 def parse_survey_response(response_text: str, order_swapped: bool, allow_ties: bool) -> Dict[str, Any]:
     """Parse the structured survey response to extract criterion evaluations."""
+    response_text = response_text.replace("\r\n", "\n")
     criteria = ["helpfulness", "correctness", "coherence", "complexity", "verbosity"]
     criterion_evaluations = {}
 
-    # Accept both ``Winner: A`` and the bracketed format requested in the prompt,
-    # e.g. ``Winner: [A]``.  Use explicit alternatives instead of a character
-    # class so invalid strings such as "AB" cannot be interpreted as a winner.
-    winner_pattern = r"(?:\[(A|B|Tie)\]|(A|B|Tie))" if allow_ties else r"(?:\[(A|B)\]|(A|B))"
+    # Decisions must occupy an explicit Winner line (or the legacy leading
+    # overall verdict), never a letter found in the surrounding assessment.
+    label = r"^[ \t]*(?:[-*][ \t]+)?(?:\*\*)?(?:Winner|Recommendation)(?:\*\*)?[ \t]*:(?:\*\*)?[ \t]*(.*)$"
+    boundary = r"(?=^[ \t]*\*{0,2}(?:\d+\.|Overall Recommendation:)|\Z)"
 
-    # Parse each criterion
+    def decision(value):
+        value = value.strip()
+        if value.startswith("**") and value.endswith("**"):
+            value = value[2:-2].strip()
+        # A single, short parenthetical comment is harmless only if it does not
+        # introduce another verdict or a choice between labels.
+        match = re.fullmatch(
+            r"(?:\[((?:Response[ \t]+)?(?:A|B)|Tie)\]|((?:Response[ \t]+)?(?:A|B)|Tie))"
+            r"(?:[ \t]+\(([^()\r\n]{1,160})\))?", value, re.IGNORECASE,
+        )
+        if not match:
+            return None
+        suffix = match.group(3) or ""
+        if (re.search(r"\b(?:Response\s+[AB]|Tie|Winner|Recommendation)\b", suffix, re.IGNORECASE)
+                or re.search(r"\b(?:A|[Bb])\b", suffix)
+                or re.search(r"\ba\s+(?:is|was|would|should|wins?|seems?|appears?|has|performs?|better|instead|overall)\b", suffix, re.I)
+                or re.search(r"\b(?:prefer|choose|pick|favor|favour|winner|rather than)\s+a\b", suffix, re.I)
+                or re.search(r"\b(?:or|and|versus|vs\.?)\s+[ab]\b", suffix, re.IGNORECASE)):
+            return None
+        token = (match.group(1) or match.group(2)).split()[-1].upper()
+        if token == "TIE":
+            return "tie" if allow_ties else None
+        return ("model2" if order_swapped else "model1") if token == "A" else (
+            "model1" if order_swapped else "model2"
+        )
+
+    def parse_section(section, allow_legacy=False):
+        labels = re.findall(label, section, re.IGNORECASE | re.MULTILINE)
+        if allow_legacy:
+            bare_lines = [line.strip() for line in section.splitlines() if re.match(
+                r"^(?:\*\*)?(?:\[(?:(?:Response[ \t]+)?[AB]|Tie)\]|(?:Response[ \t]+)?[AB]|Tie)(?![A-Za-z])",
+                line.strip(), re.I,
+            )]
+            if (labels and bare_lines) or len(bare_lines) > 1:
+                return None
+        if labels:
+            # Count malformed labels too; a valid first label must not hide a
+            # contradictory or malformed second one.
+            return decision(labels[0]) if len(labels) == 1 else None
+        if allow_legacy and section.strip():
+            leading = section.strip().splitlines()[0]
+            # Preserve the historical "[A] - explanation" overall format.
+            parts = re.split(r"[ \t]+[-—:][ \t]+", leading, maxsplit=1)
+            if len(parts) == 2 and re.fullmatch(r"(?:\[)?(?:Response\s+)?(?:A|B|Tie)(?:\])?", parts[1], re.I):
+                return None
+            winner = decision(parts[0])
+            if len(parts) == 2 and winner is not None:
+                # The legacy inline justification may mention either response,
+                # but may not explicitly nominate the other as the winner.
+                other = "B" if winner == ("model2" if order_swapped else "model1") else "A"
+                conflict = rf"\b(?:Response\s+)?{other}\s+(?:is|was|seems|appears|would be)\s+(?:(?:clearly|the|a|much|overall)\s+)*(?:better|stronger|winner|preferred)\b"
+                if re.search(conflict, parts[1], re.I):
+                    return None
+            return winner
+        return None
+
     for i, criterion in enumerate(criteria, 1):
-        # Look for the criterion section (asterisks optional for robustness)
-        pattern = rf"^[ \t]*\*{{0,2}}{i}\.\s*{criterion}\*{{0,2}}[ \t]*\n(.*?)(?=^[ \t]*\*{{0,2}}(?:\d+\.|Overall Recommendation:)|\Z)"
+        pattern = rf"^[ \t]*\*{{0,2}}{i}\.[ \t]*{criterion}\*{{0,2}}[ \t]*\n(.*?){boundary}"
         sections = re.findall(pattern, response_text, re.IGNORECASE | re.DOTALL | re.MULTILINE)
-        section = sections[0] if len(sections) == 1 else ""
-        winners = re.findall(rf"^[ \t]*(?:[-*][ \t]*)?Winner:[ \t]*{winner_pattern}[ \t]*$", section, re.IGNORECASE | re.MULTILINE)
-        justification_match = re.search(r"^[ \t]*(?:[-*][ \t]*)?Justification:[ \t]*(.+)", section, re.IGNORECASE | re.MULTILINE)
-        match = len(winners) == 1 and justification_match is not None
-
-        if match:
-            winner_raw = next(value for value in winners[0] if value).upper()
-            justification = justification_match.group(1).strip()
-
-            # Map winner to model names
-            if winner_raw == "A":
-                winner = "model2" if order_swapped else "model1"
-            elif winner_raw == "B":
-                winner = "model1" if order_swapped else "model2"
-            else:
-                # Should not happen with correct regex, but handle defensively
-                if allow_ties:
-                    winner = "tie"
-                else:
-                    # This shouldn't happen with correct regex, but if it does, treat as parsing failure
-                    winner = None
-
-            criterion_evaluations[criterion] = {
-                "winner": winner,
-                "parsing_failed": False,
-                "justification": justification
-            }
-        else:
-            # Parsing failed - set to None instead of defaulting to model1
-            criterion_evaluations[criterion] = {
-                "winner": None,
-                "parsing_failed": True,
-                "justification": "Failed to parse criterion evaluation"
-            }
+        heading_count = len(re.findall(rf"^[ \t]*\*{{0,2}}{i}\.[ \t]*{criterion}\b", response_text, re.I | re.M))
+        section = sections[0] if len(sections) == 1 and heading_count == 1 else ""
+        winner = parse_section(section)
+        justification = re.search(r"^[ \t]*(?:[-*][ \t]+)?Justification:[ \t]*(\S[^\r\n]*)", section, re.I | re.M)
+        valid = winner is not None and justification is not None
+        criterion_evaluations[criterion] = {
+            "winner": winner if valid else None,
+            "parsing_failed": not valid,
+            "justification": justification.group(1).strip() if valid else "Failed to parse criterion evaluation",
+        }
 
     # A five-dimensional score requires all five dimensions to be valid.
     successful_criteria = [eval_result for eval_result in criterion_evaluations.values() if not eval_result.get("parsing_failed", False)]
@@ -453,51 +486,17 @@ def parse_survey_response(response_text: str, order_swapped: bool, allow_ties: b
             "successful_criteria_count": len(successful_criteria)
         }
 
-    # Parse overall recommendation (asterisks optional for robustness)
-    # Only accept a leading decision, not letters inside ordinary prose.
-    overall_section_match = re.search(
-        r"\*?\*?Overall Recommendation:\*?\*?\s*(.*)$",
-        response_text,
-        re.IGNORECASE | re.DOTALL,
+    # Exactly one anchored overall section. Repeated headings/verdicts fail
+    # closed even if one of them would otherwise be parseable.
+    overall_sections = re.findall(
+        rf"^[ \t]*\*{{0,2}}Overall Recommendation:\*{{0,2}}[ \t]*\n(.*?){boundary}",
+        response_text, re.IGNORECASE | re.DOTALL | re.MULTILINE,
     )
-    overall_match = None
-    overall_section = overall_section_match.group(1).strip() if overall_section_match else ""
-    if overall_section:
-        overall_match = re.match(
-            rf"\s*(?:[-*]\s*)?(?:(?:Winner|Recommendation)\s*:\s*)?{winner_pattern}(?=[ \t]*(?:[-—:]|\n|$))",
-            overall_section, re.IGNORECASE,
-        )
-
-    if overall_match:
-        overall_winner_raw = next(value for value in overall_match.groups() if value).upper()
-        overall_justification = overall_section[overall_match.end():].lstrip(" \t\r\n-—:")
-        overall_justification = re.sub(
-            r"^(?:Explain your reasoning\.|Reasoning:)\s*", "", overall_justification, flags=re.IGNORECASE
-        ).strip() or "No separate justification supplied"
-
-        # Map overall winner to model names
-        # Respect the same tie policy for both criterion and overall decisions.
-        if overall_winner_raw == "A":
-            overall_winner = "model2" if order_swapped else "model1"
-        elif overall_winner_raw == "B":
-            overall_winner = "model1" if order_swapped else "model2"
-        elif overall_winner_raw == "TIE" and allow_ties:
-            overall_winner = "tie"
-        else:
-            # If regex matched but value is not A or B, treat as parsing failure
-            overall_winner = None
-
-        # If overall_winner is None, treat as parsing failure (even if regex matched)
-        # Missing/invalid decisions are never inferred from the survey majority.
-        if overall_winner is None:
-            overall_parsing_failed = True
-        else:
-            overall_parsing_failed = False
-    else:
-        # Parsing failed - set to None (do NOT use criterion fallback)
-        overall_winner = None
-        overall_justification = "Failed to parse overall recommendation"
-        overall_parsing_failed = True
+    overall_heading_count = len(re.findall(r"^[ \t]*\*{0,2}Overall Recommendation\b", response_text, re.I | re.M))
+    overall_section = overall_sections[0] if len(overall_sections) == 1 and overall_heading_count == 1 else ""
+    overall_winner = parse_section(overall_section, allow_legacy=True)
+    overall_parsing_failed = overall_winner is None
+    overall_justification = overall_section.strip() if overall_winner is not None else "Failed to parse overall recommendation"
 
     return {
         "criterion_evaluations": criterion_evaluations,
@@ -530,87 +529,14 @@ def setup_judge_client(api_key: str, api_provider: str = "auto", base_url: Optio
 
 def call_judge(api_type: str, judge_client, judge_model: str, prompt: str, response1: str, response2: str,
                allow_ties: bool, order_swapped: bool = False, thinking_mode: str = "disabled",
-               max_retries: int = 5) -> Dict[str, Any]:
+               max_retries: int = 5, judge_temperature: Optional[float] = DEFAULT_JUDGE_TEMPERATURE) -> Dict[str, Any]:
     """Call the judge API with survey-based evaluation across 5 criteria."""
     # Use the predetermined order (no randomization here)
     if order_swapped:
         response1, response2 = response2, response1
 
-    if allow_ties:
-        winner_format = "[A/B/Tie]"
-        choice_instruction = ""
-    else:
-        winner_format = "[A/B]"
-        choice_instruction = " - YOU MUST CHOOSE ONE"
-
-    comparison_prompt = f"""You are an expert evaluator tasked with comparing two responses to a given question. You will evaluate each response across five specific dimensions and determine which response performs better for each dimension.
-
-**Question:**
-{prompt}
-
-**Response A:**
-{response1}
-
-**Response B:**
-{response2}
-
----
-
-Please evaluate both responses on the following five dimensions:
-
-1. **Helpfulness**: How well does the response satisfy what the question asks for? Does it address the core needs of the prompt?
-
-2. **Correctness**: Does the response contain factually accurate and relevant information? Are there any hallucinations, errors, or false information?
-
-3. **Coherence**: Is the response clear, logical, and self-consistent? Does it flow well and make sense?
-
-4. **Complexity**: What is the level of intellectual depth and sophistication? Consider vocabulary, sentence structure, and whether the response demonstrates basic or expert-level understanding.
-
-5. **Verbosity**: Is the response appropriately concise or detailed relative to what the question asks for? Is it too brief, too verbose, or just right?
-
----
-
-For each dimension, provide:
-- Your assessment of Response A
-- Your assessment of Response B
-- Which response is better for this dimension ({winner_format.replace('[', '').replace(']', '')}){choice_instruction}
-- A brief justification for your choice
-
-Format your evaluation as follows:
-
-**1. Helpfulness**
-- Response A: [evaluation]
-- Response B: [evaluation]
-- Winner: {winner_format}
-- Justification: [explanation]
-
-**2. Correctness**
-- Response A: [evaluation]
-- Response B: [evaluation]
-- Winner: {winner_format}
-- Justification: [explanation]
-
-**3. Coherence**
-- Response A: [evaluation]
-- Response B: [evaluation]
-- Winner: {winner_format}
-- Justification: [explanation]
-
-**4. Complexity**
-- Response A: [evaluation]
-- Response B: [evaluation]
-- Winner: {winner_format}
-- Justification: [explanation]
-
-**5. Verbosity**
-- Response A: [evaluation]
-- Response B: [evaluation]
-- Winner: {winner_format}
-- Justification: [explanation]
-
-**Overall Recommendation:**
-Winner: {winner_format}
-Justification: [Explain your overall recommendation based on the five dimensions.]"""
+    comparison_prompt = build_comparison_prompt(prompt, response1, response2, allow_ties)
+    request_parameters = judge_request_parameters(api_type, judge_model, thinking_mode, judge_temperature)
 
     last_error = None
     for attempt in range(max_retries):
@@ -618,8 +544,7 @@ Justification: [Explain your overall recommendation based on the five dimensions
             if api_type == "anthropic":
                 response = judge_client.messages.create(
                     model=judge_model,
-                    max_tokens=8192,
-                    temperature=0.1,
+                    **request_parameters,
                     messages=[{"role": "user", "content": comparison_prompt}],
                 )
                 response_text = response.content[0].text.strip()
@@ -631,9 +556,7 @@ Justification: [Explain your overall recommendation based on the five dimensions
                 response = judge_client.chat.completions.create(
                     model=judge_model,
                     messages=[{"role": "user", "content": comparison_prompt}],
-                    max_completion_tokens=16000,
-                    response_format={"type": "text"},
-                    reasoning_effort="medium",
+                    **request_parameters,
                 )
                 response_text = response.choices[0].message.content.strip()
                 usage = {
@@ -644,14 +567,8 @@ Justification: [Explain your overall recommendation based on the five dimensions
                 request_kwargs = {
                     "model": judge_model,
                     "messages": [{"role": "user", "content": comparison_prompt}],
-                    "max_tokens": 8192,
-                    "temperature": 0.1,
+                    **request_parameters,
                 }
-                if api_type == "deepseek":
-                    request_kwargs["extra_body"] = {"thinking": {"type": thinking_mode}}
-                    if thinking_mode == "enabled":
-                        request_kwargs.pop("temperature", None)
-                        request_kwargs["reasoning_effort"] = "high"
                 response = judge_client.chat.completions.create(**request_kwargs)
                 response_text = response.choices[0].message.content.strip()
                 response_usage = getattr(response, "usage", None)
@@ -667,6 +584,9 @@ Justification: [Explain your overall recommendation based on the five dimensions
             parsed_result["raw_response"] = response_text
             parsed_result["order_swapped"] = order_swapped
             parsed_result["api_usage"] = usage
+            parsed_result["protocol_version"] = JUDGE_PROTOCOL_VERSION
+            parsed_result["parser_version"] = JUDGE_PARSER_VERSION
+            parsed_result["judge_settings"] = judge_settings_metadata(api_type, judge_model, thinking_mode, judge_temperature)
             return parsed_result
         except Exception as exc:
             last_error = exc
@@ -757,7 +677,8 @@ def analyze_bootstrap_results(bootstrap_results: List[Dict[str, Any]]) -> Dict[s
 
 
 def _cache_key(item: Dict[str, str], api_type: str, judge_model: str, allow_ties: bool,
-               order_swapped: bool, thinking_mode: str, base_url: str = "") -> str:
+               order_swapped: bool, thinking_mode: str, base_url: str = "",
+               judge_temperature: Optional[float] = DEFAULT_JUDGE_TEMPERATURE) -> str:
     payload = {
         "prompt": item["prompt"],
         "completion1": item["completion1"],
@@ -770,6 +691,12 @@ def _cache_key(item: Dict[str, str], api_type: str, judge_model: str, allow_ties
         "base_url": base_url.rstrip("/"),
         "protocol_version": JUDGE_PROTOCOL_VERSION,
         "parser_version": JUDGE_PARSER_VERSION,
+        "cache_version": JUDGE_CACHE_VERSION,
+        "judge_settings": judge_settings_metadata(api_type, judge_model, thinking_mode, judge_temperature),
+        "prompt_sha256": hashlib.sha256(build_comparison_prompt(
+            item["prompt"], item["completion2"] if order_swapped else item["completion1"],
+            item["completion1"] if order_swapped else item["completion2"], allow_ties,
+        ).encode("utf-8")).hexdigest(),
     }
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
@@ -826,6 +753,7 @@ def _analyze_iteration(iteration_results: List[Dict[str, Any]]) -> Dict[str, Any
             "order_disagreement_rate": counts["order_disagreement"] / len(valid) if valid else None,
             "model1_mean_score": model1_mean,
             "model2_mean_score": 1 - model1_mean if valid else None,
+            "order_diagnostics": order_diagnostics(iteration_results, endpoint),
         }
     return output
 
@@ -835,7 +763,8 @@ def run_bootstrap_evaluation(meta1: Dict[str, Any], items1: List[Dict[str, str]]
                              N: int, B: int, judge_model: str, api_type: str, judge_client,
                              allow_ties: bool, seed: int, cache_path: str,
                              thinking_mode: str = "disabled", refresh_cache: bool = False,
-                             max_retries: int = 5, base_url: str = "", judge_both_orders: bool = False) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[int]]:
+                             max_retries: int = 5, base_url: str = "", judge_both_orders: bool = False,
+                             judge_temperature: Optional[float] = DEFAULT_JUDGE_TEMPERATURE) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[int]]:
     """Judge each prompt once or in both orders, then bootstrap prompt clusters."""
     if np is None:
         raise ImportError("numpy is required for bootstrap sampling. Please install it with: pip install numpy")
@@ -862,7 +791,7 @@ def run_bootstrap_evaluation(meta1: Dict[str, Any], items1: List[Dict[str, str]]
         orders = [first_order, not first_order] if judge_both_orders else [first_order]
         order_results = []
         for order_swapped in orders:
-            cache_key = _cache_key(item, api_type, judge_model, allow_ties, order_swapped, thinking_mode, base_url)
+            cache_key = _cache_key(item, api_type, judge_model, allow_ties, order_swapped, thinking_mode, base_url, judge_temperature)
             cached_result = cached_results.get(cache_key)
             if cached_result is None:
                 judgment = call_judge(
@@ -876,6 +805,7 @@ def run_bootstrap_evaluation(meta1: Dict[str, Any], items1: List[Dict[str, str]]
                     order_swapped=order_swapped,
                     thinking_mode=thinking_mode,
                     max_retries=max_retries,
+                    judge_temperature=judge_temperature,
                 )
                 result = {
                     "prompt": item["prompt"],
@@ -926,7 +856,8 @@ def save_bootstrap_results(output_path: str, model1_path: str, model2_path: str,
                           judged_results: List[Dict[str, Any]], selected_indices: List[int],
                           cache_path: str, base_url: Optional[str], thinking_mode: str,
                           completion_index: int = 0, validation: Optional[Dict[str, Any]] = None,
-                          judge_both_orders: bool = False, source_metadata=None) -> None:
+                          judge_both_orders: bool = False, source_metadata=None,
+                          judge_temperature: Optional[float] = DEFAULT_JUDGE_TEMPERATURE) -> None:
     """Save comprehensive bootstrap results to JSON file."""
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
 
@@ -956,6 +887,11 @@ def save_bootstrap_results(output_path: str, model1_path: str, model2_path: str,
             "base_url": base_url,
             "protocol_version": JUDGE_PROTOCOL_VERSION,
             "parser_version": JUDGE_PARSER_VERSION,
+            "cache_version": JUDGE_CACHE_VERSION,
+            "judge_settings": judge_settings_metadata(api_type, judge_model, thinking_mode, judge_temperature),
+            "primary_endpoint": "overall",
+            "survey_interpretation": "secondary equal-weight diagnostic; not the overall decision rule",
+            "complexity_definition": "legacy key: task-appropriate depth, not sophistication or complexity itself",
             "cache_path": os.path.abspath(cache_path),
             "judge_both_orders": judge_both_orders,
             "aggregation_version": "paired-order-score-v1" if judge_both_orders else "single-order-v1",
@@ -1097,6 +1033,10 @@ def print_paired_order_summary(observed, bootstrap_analysis):
               f"model1 consistent wins={counts['model1_wins']}, model2 consistent wins={counts['model2_wins']}, "
               f"explicit ties={counts['ties']}, order disagreements={counts['order_disagreements']}")
         print(f"  Model2 score={counts['model2_mean_score']:.4f}, prompt-bootstrap 95% CI={ci}; neutral=0.5")
+        diagnostics = counts["order_diagnostics"]
+        print(f"  Pair outcomes: {diagnostics['pair_outcomes']}")
+        print(f"  Presentation-position choices: {diagnostics['presentation_position']}")
+    print("Order diagnostics are descriptive; they do not establish that position caused the disagreements.")
     print("The interval describes prompt sampling conditional on these checkpoints/responses/judge outcomes, "
           "not uncertainty across training seeds. A CI crossing 0.5 is inconclusive.")
 
@@ -1117,6 +1057,9 @@ def main():
     )
     parser.add_argument("--thinking-mode", choices=["enabled", "disabled"], default="disabled")
     parser.add_argument("--max-retries", type=int, default=5)
+    parser.add_argument("--judge-temperature", type=lambda value: None if value.lower() == "default" else float(value),
+                        default=DEFAULT_JUDGE_TEMPERATURE,
+                        help="Judge sampling temperature (default: 0); use 'default' to omit. Ignored in supported reasoning-only modes.")
     parser.add_argument("--min-valid-fraction", type=float, default=1.0,
                         help="Required valid overall AND full-survey fraction (default: all judgments)")
     parser.add_argument("--N", type=int, default=100, help="Number of unique prompt pairs sent to the judge")
@@ -1135,6 +1078,11 @@ def main():
     if not 0 < args.min_valid_fraction <= 1 or args.max_retries < 1:
         parser.error("min-valid-fraction must be in (0, 1] and max-retries must be positive")
 
+    try:
+        judge_request_parameters(args.api_provider, args.judge_model, args.thinking_mode, args.judge_temperature)
+    except ValueError as exc:
+        parser.error(str(exc))
+
     # Load both completion files
     print(f"Loading completions from: {args.completions1}")
     print(f"Using completion index: {args.completion_index} (0=first, 1=second, etc.)")
@@ -1145,7 +1093,7 @@ def main():
     meta2, items2 = read_single_completions_artifact(args.completions2, completion_index=args.completion_index)
     print(f"Loaded {len(items2)} completions from second file")
 
-    allow_ties = args.allow_ties
+    allow_ties = not args.no_ties
 
     output_dir = determine_output_directory(args.completions1, args.completions2, args.output_dir)
     os.makedirs(output_dir, exist_ok=True)
@@ -1183,6 +1131,7 @@ def main():
         max_retries=args.max_retries,
         base_url=resolved_base_url,
         judge_both_orders=args.judge_both_orders,
+        judge_temperature=args.judge_temperature,
     )
 
     # Analyze bootstrap results
@@ -1209,6 +1158,9 @@ def main():
         allow_ties,
         completion_index=args.completion_index
     )
+    namespace = _cache_key({"prompt": "", "completion1": "", "completion2": ""}, api_type, args.judge_model,
+                           allow_ties, False, args.thinking_mode, resolved_base_url, args.judge_temperature)[:12]
+    filename = filename.replace("_bootstrap.json", f"_protocol{namespace}_bootstrap.json")
     if args.judge_both_orders:
         filename = filename.replace("_bootstrap.json", "_both_orders_bootstrap.json")
     output_path = os.path.join(output_dir, filename)
@@ -1233,6 +1185,7 @@ def main():
         completion_index=args.completion_index,
         validation=validation,
         judge_both_orders=args.judge_both_orders,
+        judge_temperature=args.judge_temperature,
         source_metadata={"model1": meta1, "model2": meta2},
     )
 

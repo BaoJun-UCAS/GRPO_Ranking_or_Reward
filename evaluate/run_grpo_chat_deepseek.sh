@@ -22,6 +22,7 @@ MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-1024}"
 JUDGE_MODEL="${JUDGE_MODEL:-deepseek-flash}"
 JUDGE_BASE_URL="${JUDGE_BASE_URL:-https://api.deepseek.com}"
 JUDGE_THINKING_MODE="${JUDGE_THINKING_MODE:-disabled}"
+JUDGE_TEMPERATURE="${JUDGE_TEMPERATURE:-0}"
 EVAL_SEED="${EVAL_SEED:-42}"
 PYTHON="${PYTHON:-python}"
 MAX_PROMPT_LENGTH="${EVAL_MAX_PROMPT_LENGTH:-2048}"
@@ -85,6 +86,7 @@ TRAINED_COMPLETIONS="${COMPLETIONS_DIR}/qwen3-1.7b-grpo-regular-lora-chat_N${NUM
     printf 'judge_model=%s\n' "${JUDGE_MODEL}"
     printf 'judge_base_url=%s\n' "${JUDGE_BASE_URL}"
     printf 'judge_thinking_mode=%s\n' "${JUDGE_THINKING_MODE}"
+    printf 'judge_temperature=%s\n' "${JUDGE_TEMPERATURE}"
     printf 'git_commit=%s\n' "$(git rev-parse HEAD 2>/dev/null || printf unknown)"
 } > "${EVAL_DIR}/evaluation.env"
 
@@ -123,6 +125,7 @@ generate_if_missing "${TRAINED_MODEL}" "${TRAINED_COMPLETIONS}" "${LOG_DIR}/gene
     --base-url "${JUDGE_BASE_URL}" \
     --judge-model "${JUDGE_MODEL}" \
     --thinking-mode "${JUDGE_THINKING_MODE}" \
+    --judge-temperature "${JUDGE_TEMPERATURE}" \
     --N "${NUM_PROMPTS}" \
     --B "${BOOTSTRAP_ITERATIONS}" \
     --seed "${EVAL_SEED}" \

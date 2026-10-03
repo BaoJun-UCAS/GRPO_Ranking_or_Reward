@@ -178,7 +178,7 @@ class GRPOConfig(trl.GRPOConfig):
     advantage: str = field(
         default="studentization",
         metadata={"help": (
-            "Advantage registry name: studentization (alias grpo), robust_pairwise, ranking, "
+            "Advantage registry name: studentization (alias grpo), robust_pairwise, rolling_quantile_pairwise, ranking, "
             "rank_reward, or module:function. robust_pairwise uses raw weighted reward differences "
             "without group-std normalization; top-level scale_rewards does not change it."
         )}
@@ -187,7 +187,8 @@ class GRPOConfig(trl.GRPOConfig):
         default=None, metadata={"help": (
             "Selected advantage function options (YAML mapping or JSON). robust_pairwise takes "
             "delta >= 0 and c > 0 in raw weighted reward units (defaults 0.02 and 0.2 are "
-            "uncalibrated examples). advantage_kwargs.delta is distinct from top-level PPO delta."
+            "uncalibrated examples). advantage_kwargs.delta is distinct from top-level PPO delta. "
+            "rolling_quantile_pairwise requires p,q; optional window_size (global rollouts) and epsilon."
         )},
     )
     token_broadcast: str = field(

@@ -1,0 +1,9 @@
+# Reuse the completed pilot's original checkpoint, optimizer and prompt plan.
+source_experiment: grpo_runs/advantage-200
+hub_cache: /data/baojun/cache/grpo/huggingface/hub
+steps: 200
+delta: 0.002
+c: 0.08
+k: 2.46
+epsilon: 0.0001
+# Sequential arms; source GPU layout: vLLM=4, QRM=5, training=6,7.

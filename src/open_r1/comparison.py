@@ -25,6 +25,10 @@ import sys
 import yaml
 
 from open_r1.evaluation import digest, model_fingerprint
+from open_r1.judge_protocol import (
+    DEFAULT_JUDGE_TEMPERATURE, JUDGE_CACHE_VERSION, JUDGE_PARSER_VERSION, JUDGE_PROTOCOL_VERSION,
+    build_comparison_prompt, judge_settings_metadata,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG = ROOT / 'recipes/Qwen3-1.7B/advantage_comparison_200.yaml'
@@ -71,6 +75,22 @@ def resolve_path(value):
     return path.resolve() if path.is_absolute() else (ROOT / path).resolve()
 
 
+def improved_spec(config):
+    """Keep historical robust experiments intact; opt into method 1 explicitly."""
+    method = config.get('improved_advantage', 'robust_pairwise')
+    if method == 'robust_pairwise':
+        options = config.get('improved_advantage_kwargs', {'delta': config.get('delta'), 'c': config.get('c')})
+    elif method == 'rolling_quantile_pairwise':
+        options = config.get('improved_advantage_kwargs')
+        if not isinstance(options, dict) or not {'p', 'q'} <= options.keys():
+            raise ValueError('rolling_quantile_pairwise requires improved_advantage_kwargs.p and q')
+    else:
+        raise ValueError('improved_advantage must be robust_pairwise or rolling_quantile_pairwise')
+    from open_r1.advantages import configure_advantage
+    configure_advantage(method, options, scale_rewards=True)  # Validate before preparing data/models.
+    return method, deepcopy(options)
+
+
 def checked_config(path, dataset_override=None):
     config = yaml.safe_load(Path(path).read_text(encoding='utf-8'))
     if not isinstance(config, dict):
@@ -88,11 +108,7 @@ def checked_config(path, dataset_override=None):
     batch = config['world_size'] * config['per_device_train_batch_size'] * config['gradient_accumulation_steps']
     if config['num_generations'] < 2 or batch % config['num_generations']:
         raise ValueError('num_generations >= 2 must divide the global generation batch')
-    for name in ('delta', 'c'):
-        if not isinstance(config.get(name), (int, float)) or isinstance(config[name], bool) or not math.isfinite(config[name]):
-            raise ValueError(f'{name} must be finite')
-    if config['delta'] < 0 or config['c'] <= 0:
-        raise ValueError('delta must be nonnegative and c positive')
+    improved_spec(config)
     for prefix in ('model', 'qrm'):
         name = config[f'{prefix}_name' if prefix == 'model' else 'qrm_model']
         if not Path(name).expanduser().is_dir() and not re.fullmatch(r'[0-9a-fA-F]{40}', str(config[f'{prefix}_revision'])):
@@ -154,10 +170,10 @@ def prepare(config_path, directory, dataset_override=None):
         (directory / 'configs').mkdir()
         shared = build_recipe(config, data_dir)
         files = {}
-        for arm, (advantage, options) in ARMS.items():
+        for arm in ARMS:
+            advantage, options = ('grpo', {}) if arm == 'baseline' else improved_spec(config)
             recipe = deepcopy(shared)
-            recipe.update(advantage=advantage, advantage_kwargs=options if options is not None else {
-                'delta': config['delta'], 'c': config['c']})
+            recipe.update(advantage=advantage, advantage_kwargs=options)
             name = f'configs/{arm}.yaml'
             (directory / name).write_text(yaml.safe_dump(recipe, sort_keys=False), encoding='utf-8')
             files[name] = file_sha256(directory / name)
@@ -430,6 +446,13 @@ def judge_settings(config):
         settings[name] = os.environ.get(variable) or settings[name]
     if settings['api_provider'] not in ('openai', 'deepseek', 'anthropic') or not settings['model']:
         raise ValueError('Set JUDGE_MODEL and an api_provider of openai/deepseek/anthropic')
+    value = os.environ.get('JUDGE_TEMPERATURE', settings.get('temperature', DEFAULT_JUDGE_TEMPERATURE))
+    settings['temperature'] = None if value is None or str(value).lower() == 'default' else float(value)
+    settings['request_settings'] = judge_settings_metadata(
+        settings['api_provider'], settings['model'], settings['thinking_mode'], settings['temperature'])
+    settings.update(protocol_version=JUDGE_PROTOCOL_VERSION, parser_version=JUDGE_PARSER_VERSION,
+                    cache_version=JUDGE_CACHE_VERSION,
+                    prompt_template_sha256=digest(build_comparison_prompt('', '', '', True)))
     key_name = {'openai': 'OPENAI_API_KEY', 'deepseek': 'DEEPSEEK_API_KEY', 'anthropic': 'ANTHROPIC_API_KEY'}[settings['api_provider']]
     key = os.environ.get('JUDGE_API_KEY') or os.environ.get(key_name)
     if not key:
@@ -453,6 +476,7 @@ def judge(directory):
                '--completions2', directory / 'evaluation/completions/improved.json',
                '--api-provider', settings['api_provider'], '--judge-model', settings['model'],
                '--thinking-mode', settings['thinking_mode'], '--max-retries', settings['max_retries'],
+               '--judge-temperature', 'default' if settings['temperature'] is None else settings['temperature'],
                '--N', config['evaluation']['num_prompts'], '--B', config['evaluation']['bootstrap_iterations'],
                '--seed', config['evaluation']['seed'], '--allow-ties', '--judge-both-orders',
                '--min-valid-fraction', 1.0, '--output-dir', output, '--cache-path', output / 'judge_cache.jsonl']
@@ -469,7 +493,7 @@ def judge(directory):
     interval = report['bootstrap_analysis']['overall_winner_analysis']['model2_score_distribution']['ci_95']
     write_json(directory / 'comparison_result.json', {
         'status': 'completed', 'model1': 'baseline: original GRPO advantage',
-        'model2': 'improved: robust_pairwise advantage', 'judge_results_directory': str(output),
+        'model2': f"improved: {config.get('improved_advantage', 'robust_pairwise')} advantage", 'judge_results_directory': str(output),
         'data_order_audit': str(directory / 'data_order_audit.json'),
         'raw_judge_report': str(reports[0]), 'observed': observed,
         'improved_mean_score': observed['model2_mean_score'], 'improved_score_ci95': interval,
